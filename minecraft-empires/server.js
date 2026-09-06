@@ -1,0 +1,757 @@
+const http = require('http');
+const path = require('path');
+const crypto = require('crypto');
+const fs = require('fs');
+const express = require('express');
+const { WebSocketServer } = require('ws');
+
+const PORT = Number(process.env.PORT || 3000);
+const app = express();
+app.use(express.json({limit:'2mb'}));
+app.use(express.static(path.join(__dirname,'public')));
+app.get('/health', (_,res)=>res.json({ok:true}));
+const server = http.createServer(app);
+const wss = new WebSocketServer({server});
+
+const NATIONS = ['Yelusia','RDPG','Latinus','DSPA','USRR','Finllandë','Yukiguni','Leasath','Lythuria','Orenbirsk','Azilus','Republic of Bananas','Vanilicia','Afrem','Cankultaän','Vulpéria'];
+const CATALOG = {
+ 'Infantaria':{hp:1,dmg:1,rangeVis:2},'Tanque Pesado':{hp:75,dmg:45,rangeVis:2},'Tanque Médio':{hp:60,dmg:45,rangeVis:2},'Tanque Leve':{hp:40,dmg:25,rangeVis:2},'Anti-Air':{hp:20,dmg:25,rangeVis:2},'Caça-Tanque':{hp:50,dmg:65,rangeVis:2},'Artilharia Móvel':{hp:30,dmg:50,rangeVis:2},'Artilharia Pesada':{hp:60,dmg:60,rangeVis:2},'Engenharia de Combate':{hp:40,dmg:0,rangeVis:2},'Navio Pequeno (Patrulha)':{hp:100,dmg:30,rangeVis:3},'Submarino':{hp:200,dmg:60,rangeVis:3},'Battleship':{hp:1000,dmg:100,rangeVis:4},'Porta-Aviões':{hp:1000,dmg:40,rangeVis:4},'Navio Médio (Destroyer)':{hp:400,dmg:50,rangeVis:3},'Navio Carga/Transporte':{hp:200,dmg:10,rangeVis:2},'Desembarque Médio':{hp:200,dmg:15,rangeVis:2},'Desembarque Pequeno':{hp:100,dmg:10,rangeVis:2},'Desembarque Grande':{hp:200,dmg:20,rangeVis:2},'Avião Caça (Fighter)':{hp:40,dmg:45,rangeVis:10},'Attacker Médio/Pequeno':{hp:45,dmg:55,rangeVis:8},'Bombardeiro Médio':{hp:60,dmg:70,rangeVis:8},'Bombardeiro Grande':{hp:80,dmg:120,rangeVis:8}
+};
+const rooms = new Map();
+const CAMPAIGN_DIR = process.env.CAMPAIGN_DIR || path.join(__dirname,'data','campaigns');
+fs.mkdirSync(CAMPAIGN_DIR,{recursive:true});
+const campaignPath = c => path.join(CAMPAIGN_DIR, String(c).toUpperCase().replace(/[^A-Z0-9_-]/g,'' ) + '.json');
+function serializeRoom(r){
+  return {version:4, savedAt:Date.now(), room:{code:r.code,name:r.name,fog:true,round:r.round,status:r.status,sides:r.sides,fullState:r.fullState,setupTerritoryOwners:r.setupTerritoryOwners||{},createdAt:r.createdAt,hostToken:r.hostToken,isCampaign:!!r.isCampaign,resumeSavedStatus:r.resumeSavedStatus||r.status,resumePending:!!r.resumePending,orderDurationMs:r.orderDurationMs,ordersOpenAt:r.ordersOpenAt,ordersCloseAt:r.ordersCloseAt,executeAt:r.executeAt,ordersBySide:r.ordersBySide,placementReady:r.sides.map(s=>({id:s.id,ready:!!s.ready})),treaties:r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}},warStats:r.warStats||{committedBySide:{},killedBySide:{},registeredUnits:{}}}};
+}
+function saveCampaign(r){
+  try{
+    fs.mkdirSync(CAMPAIGN_DIR,{recursive:true});
+    if(r.isCampaign && !r.resumePending && r.status) r.resumeSavedStatus=String(r.status);
+    const payload=serializeRoom(r);
+    fs.writeFileSync(campaignPath(r.code),JSON.stringify(payload,null,2),'utf8');
+    return true;
+  }catch(e){console.error('campaign save:',e.message);return false;}
+}
+function normalizeLoadedRoom(r){
+  r.round=Math.max(1,Number(r.round)||1);
+  r.status=String(r.status||'lobby');
+  r.setupTerritoryOwners=sanitizeTerritoryOwners(r.setupTerritoryOwners||r.fullState?.territoryOwners||{});
+  r.fullState=r.fullState&&typeof r.fullState==='object'?r.fullState:{units:[],territoryOwners:r.setupTerritoryOwners,reconIntel:{},log:[]};
+  r.fullState.units=(Array.isArray(r.fullState.units)?r.fullState.units:[]).map(normalizeUnitForServer).filter(Boolean);
+  r.fullState.territoryOwners=sanitizeTerritoryOwners(r.fullState.territoryOwners||r.setupTerritoryOwners||{});
+  r.fullState.reconIntel=r.fullState.reconIntel&&typeof r.fullState.reconIntel==='object'?r.fullState.reconIntel:{};
+  r.fullState.log=Array.isArray(r.fullState.log)?r.fullState.log.slice(-160):[];
+  r.treaties=r.treaties&&typeof r.treaties==='object'?r.treaties:{telegrams:[],truce:null,peace:null,resumeReady:{}};
+  r.treaties.telegrams=Array.isArray(r.treaties.telegrams)?r.treaties.telegrams.slice(-100):[];
+  r.treaties.truce=r.treaties.truce||null;r.treaties.peace=r.treaties.peace||null;r.treaties.resumeReady=r.treaties.resumeReady||{};
+  r.warStats=r.warStats&&typeof r.warStats==='object'?r.warStats:{committedBySide:{},killedBySide:{},registeredUnits:{}};
+  ensureWarStats(r);
+  registerWarUnits(r,r.fullState.units);
+}
+function loadCampaigns(){
+  for(const f of fs.readdirSync(CAMPAIGN_DIR)){
+    if(!f.endsWith('.json'))continue;
+    try{const d=JSON.parse(fs.readFileSync(path.join(CAMPAIGN_DIR,f),'utf8'));const r=d.room;if(!r?.code||!Array.isArray(r.sides))continue;
+      normalizeLoadedRoom(r);
+      r.timer=null;r.resolving=false;r.resolvingUntil=null;r.resolveRound=null;r.resolutionToken=null;r.resolutionResultReceived=false;r.awaitingNextRound=false;r.nextRoundReady={};r.placementCommitPending=false;r.placementUnitsBySide={};r.treaties.resumeReady=r.treaties.resumeReady||{};
+      r.isCampaign=true;
+      r.resumeSavedStatus=String(r.status||'lobby');
+      r.resumePending=true;
+      r.hostConnected=false;r.hostAttached=false;r.sides.forEach(s=>{s.connected=false;s.ready=false;});
+      r.treaties.resumeReady=r.treaties.resumeReady||{};
+      r.nextRoundReady={}; r.awaitingNextRound=false; r.resolving=false; r.resolvingUntil=null; r.resolveRound=null; r.resolutionToken=null; r.resolutionResultReceived=false;
+      if(r.timer)clearTimeout(r.timer); r.timer=null;
+      if(r.resolveWatchdog)clearTimeout(r.resolveWatchdog); r.resolveWatchdog=null;
+      if(r.status!=='finished') r.status='lobby';
+      rooms.set(r.code,r);
+
+    }catch(e){console.error('campaign load:',f,e.message);}
+  }
+}
+function campaignList(){return [...rooms.values()].map(r=>{syncConnections(r);return {code:r.code,name:r.name,status:r.status,round:r.round,sides:r.sides.map(s=>({id:s.id,name:s.name,alliance:s.alliance,countries:s.countries,connected:!!s.connected})),orderDurationMs:r.orderDurationMs,ordersCloseAt:r.ordersCloseAt,territorySetupCount:Object.keys(r.setupTerritoryOwners||{}).length,savedStatus:r.resumeSavedStatus||r.status,savedAt:fs.existsSync(campaignPath(r.code))?fs.statSync(campaignPath(r.code)).mtimeMs:null};});
+}
+const peers = new Map();
+const sha = s => crypto.createHash('sha256').update(String(s ?? '')).digest('hex');
+const token = () => crypto.randomBytes(18).toString('hex');
+const resolutionToken = () => crypto.randomBytes(10).toString('hex');
+
+function sanitizeTerritoryOwners(input){
+  const clean={};
+  if(!input || typeof input!=='object') return clean;
+  for(const [k,v] of Object.entries(input)){
+    if(/^\d+,\d+$/.test(k) && (!v || NATIONS.includes(v))) clean[k]=v;
+  }
+  return clean;
+}
+function normalizeUnitForServer(u){
+  if(!u || typeof u!=='object') return null;
+  const c=CATALOG[u.type]||{hp:1,dmg:0,rangeVis:0};
+  const q=Math.max(0,Math.floor(Number(u.quantity)||0));
+  const out={...u};
+  out.quantity=q;
+  out.hp=q;
+  out.maxHp=q;
+  out.initialQuantity=Number.isFinite(Number(u.initialQuantity))?Math.max(0,Math.floor(Number(u.initialQuantity))):q;
+  out.initialMaxHp=(Number(u.initialMaxHp)>0?Number(u.initialMaxHp):out.initialQuantity*c.hp);
+  const maxHp=Math.max(q*c.hp,out.initialMaxHp);
+  out.currentHp=Number.isFinite(Number(u.currentHp))?Math.min(Math.max(0,Number(u.currentHp)),maxHp):q*c.hp;
+  out.dmg=c.dmg;
+  out.rangeVis=c.rangeVis;
+  out.positionLocked=!!u.positionLocked;
+  out.positionRound=Number.isFinite(Number(u.positionRound))?Number(u.positionRound):null;
+  return out;
+}
+const code = () => crypto.randomBytes(3).toString('hex').toUpperCase();
+const MONTH = 30*24*60*60*1000;
+function normalizeDuration(value, unit){
+  const n=Math.max(1,Math.floor(Number(value)||0));
+  const mult={ms:1,s:1000,m:60000,h:3600000,d:86400000,w:604800000,month:MONTH}[unit]||1000;
+  return Math.min(n*mult, MONTH);
+}
+function cleanSides(input){
+  return (Array.isArray(input)?input:[]).slice(0,8).map((s,i)=>({
+    id:`S${i+1}`, name:String(s.name||`Lado ${i+1}`).slice(0,40),
+    alliance:String(s.alliance||`A${i+1}`).slice(0,30),
+    countries:[...new Set((Array.isArray(s.countries)?s.countries:[]).filter(n=>NATIONS.includes(n)))],
+    passwordHash:sha(s.password||'')
+  })).filter(s=>s.countries.length);
+}
+function syncConnections(r){
+  const connectedIds=new Set();
+  let actualHost=false;
+  for(const p of peers.values()){
+    if(p.roomCode===r.code && p.sideId) connectedIds.add(p.sideId);
+    if(p.roomCode===r.code && p.role==='host') actualHost=true;
+  }
+  // S1 remains reserved for the creator even before the WebSocket finishes attaching.
+  // Once attached, its live connection is authoritative.
+  r.hostConnected=actualHost || (!r.hostAttached && r.hostConnected===true);
+  for(const s of r.sides) s.connected=connectedIds.has(s.id);
+  const s1=r.sides.find(s=>s.id==='S1'); if(s1) s1.connected=r.hostConnected;
+  return connectedIds;
+}
+function tryResumeCampaign(r){
+  if(!r?.isCampaign || !r.resumePending) return false;
+  syncConnections(r);
+  if(!(r.sides||[]).every(s=>s.connected)) return false;
+  r.resumePending=false;
+  const saved=String(r.resumeSavedStatus||'playing');
+  if(saved==='truce'){
+    r.status='truce';
+    r.treaties.resumeReady={};
+    persist(r); broadcast(r);
+    return true;
+  }
+  if(saved==='placement'){
+    r.status='placement'; r.sides.forEach(s=>s.ready=false); r.placementCommitPending=false; r.placementUnitsBySide={};
+    persist(r); broadcast(r);
+    return true;
+  }
+  if(saved==='finished'){
+    r.status='finished'; persist(r); broadcast(r); return true;
+  }
+  // Campanha salva durante uma rodada ou na pausa: reabre uma nova janela de ordens
+  // na mesma rodada, preservando tropas, territórios, intel e histórico já salvos.
+  r.status='playing';
+  startRound(r,false);
+  return true;
+}
+function publicConfig(r){syncConnections(r);return {
+  code:r.code,name:r.name,status:r.status,fog:true,round:r.round,
+  orderDurationMs:r.orderDurationMs,ordersOpenAt:r.ordersOpenAt,ordersCloseAt:r.ordersCloseAt,executeAt:r.executeAt,resolving:!!r.resolving,resolvingUntil:r.resolvingUntil||null,awaitingNextRound:!!r.awaitingNextRound,nextRoundReady:r.sides.map(s=>({id:s.id,ready:!!(r.nextRoundReady&&r.nextRoundReady[s.id])})),placementReady:r.sides.map(s=>({id:s.id,ready:!!s.ready})),territorySetupCount:Object.keys(r.setupTerritoryOwners||{}).length,warReport:r.fullState?.warReport||null,warStats:ensureWarStats(r),treaties:{telegrams:(r.treaties?.telegrams||[]).slice(-100),truce:r.treaties?.truce||null,peace:r.treaties?.peace||null,resumeReady:r.treaties?.resumeReady||{}},
+  sides:r.sides.map(s=>({id:s.id,name:s.name,alliance:s.alliance,countries:s.countries,connected:!!s.connected,ready:!!s.ready}))
+};}
+function sideFor(r, player){return r.sides.find(s=>s.id===player.sideId);}
+function allianceFor(r, side){return side?.alliance || null;}
+function allies(r, side){return r.sides.filter(s=>s.alliance===allianceFor(r,side));}
+function coalitionCountries(r, side){return allies(r,side).flatMap(s=>s.countries);}
+function canSee(r, side, u){
+  if(!side) return false;
+  // Membros da mesma aliança são SEMPRE visíveis entre si, independentemente
+  // da distância, da fase (lobby/posicionamento/batalha) ou do fog of war.
+  const friendly=coalitionCountries(r,side);
+  if(friendly.includes(u.nation)) return true;
+  if(!r.fog) return true;
+  const range=(CATALOG[u.type]||{}).rangeVis||0;
+  return (r.fullState?.units||[]).some(a=>friendly.includes(a.nation)&&Math.hypot(a.x-u.x,a.y-u.y)<=range*20);
+}
+function filteredUnits(r, side){
+  return (r.fullState?.units||[]).filter(u=>canSee(r,side,u)).map(u=>({...u}));
+}
+function rebuildReconIntel(r){
+  const out={};
+  for(const s of r.sides){for(const n of s.countries)out[n]={};}
+  const all=r.fullState?.units||[];
+  for(const scout of all){
+    if(scout.action!=='Reconhecimento'||Number(scout.hp||0)<=0)continue;
+    const scoutSide=r.sides.find(s=>s.countries.includes(scout.nation));
+    if(!scoutSide)continue;
+    const friendly=new Set(coalitionCountries(r,scoutSide));
+    const range=(CATALOG[scout.type]||{}).rangeVis||0;
+    const rangePx=range*20;
+    for(const enemy of all){
+      if(enemy.hp<=0||friendly.has(enemy.nation))continue;
+      if(Math.hypot(Number(enemy.x)-Number(scout.x),Number(enemy.y)-Number(scout.y))<=rangePx){
+        if(!out[scout.nation])out[scout.nation]={};
+        out[scout.nation][String(enemy.id)]={id:enemy.id,nation:enemy.nation,type:enemy.type,symbol:enemy.symbol,code:enemy.code||'',x:enemy.x,y:enemy.y,quantity:Number(enemy.quantity)||0,hp:Number(enemy.currentHp ?? enemy.hp ?? 0),maxHp:Number(enemy.initialMaxHp||enemy.maxHp||enemy.hp||0),spottedAt:Date.now()};
+      }
+    }
+  }
+  return out;
+}
+function filteredIntel(r,side){
+  const out={};
+  for(const n of coalitionCountries(r,side)) Object.assign(out,r.fullState?.reconIntel?.[n]||{});
+  return out;
+}
+function filteredLog(r,side){
+  const friendly=new Set(coalitionCountries(r,side||{}));
+  const log=r.fullState?.log||[];
+  return Array.isArray(log)?log.map(html=>{
+    if(typeof html!=='string'||!html.includes(' moveu ')) return html;
+    const m=html.match(/<b>\s*([^<]+?)\s*<\/b>\s+moveu\b/);
+    if(!m||friendly.has(m[1].trim())) return html;
+    return html
+      .replace(/\s+para\s+\([^)]*\)/,' para (LOCALIZAÇÃO CENSURADA)')
+      .replace(/\s+até o local de encontro\s+\([^)]*\)/,' até o local de encontro (LOCALIZAÇÃO CENSURADA)');
+  }):[];
+}
+function visibleState(r,p){
+  const side=sideFor(r,p); const fs=r.fullState||{};
+  return {type:'state',config:publicConfig(r),sideId:p.sideId||null,countries:side?.countries||[],alliedCountries:coalitionCountries(r,side||{}),units:filteredUnits(r,side),territoryOwners:fs.territoryOwners||r.setupTerritoryOwners||{},reconIntel:filteredIntel(r,side),log:filteredLog(r,side),fog:true,round:r.round,treaties:{telegrams:(r.treaties?.telegrams||[]).slice(-100),truce:r.treaties?.truce||null,peace:r.treaties?.peace||null,resumeReady:r.treaties?.resumeReady||{}},warReport:fs.warReport||null,orders:r.ordersBySide?.[p.sideId]||{}};
+}
+function send(ws,obj){if(ws.readyState===1)ws.send(JSON.stringify(obj));}
+function broadcast(r){for(const [ws,p] of peers){if(p.roomCode===r.code)send(ws,visibleState(r,p));}}
+function toHost(r,msg){for(const [ws,p] of peers){if(p.roomCode===r.code&&p.role==='host'){send(ws,msg);return true;}}return false;}
+function persist(r){saveCampaign(r);}
+function startRound(r, advance=false){
+  const now=Date.now();
+  r.status='playing';
+  if(advance) r.round=Math.max(1,Number(r.round||1)+1); else r.round=Math.max(1,Number(r.round||1));
+  r.ordersBySide={};
+  for(const s of r.sides) r.ordersBySide[s.id]={count:0,lastAt:null};
+  r.ordersOpenAt=now; r.ordersCloseAt=now+r.orderDurationMs; r.executeAt=r.ordersCloseAt;
+  r.resolving=false; r.resolveRound=null; r.resolvingUntil=null; r.resolveStartedAt=null; r.resolveWatchdog=null;
+  r.awaitingNextRound=false; r.nextRoundReady={};
+  broadcast(r); persist(r); scheduleResolution(r);
+}
+loadCampaigns();
+
+function scheduleResolution(r){
+  if(r.timer)clearTimeout(r.timer);
+  r.timer=null;
+  if(r.status!=='playing'||!r.executeAt||r.resolving||r.awaitingNextRound)return;
+  const delay=Math.max(0,r.executeAt-Date.now());
+  r.timer=setTimeout(()=>{
+    r.timer=null;
+    if(!rooms.has(r.code)||r.status!=='playing'||r.resolving)return;
+    const round=Number(r.round);
+    const deadline=Number(r.executeAt);
+    r.resolving=true;
+    r.resolveRound=round;
+    r.resolutionToken=resolutionToken();
+    r.resolutionResultReceived=false;
+    r.resolveStartedAt=Date.now();
+    r.resolvingUntil=r.resolveStartedAt+2000;
+    broadcast(r);
+    persist(r);
+    r.timer=setTimeout(()=>{
+      r.timer=null;
+      if(!rooms.has(r.code)||r.status!=='playing'||!r.resolving||Number(r.resolveRound)!==round)return;
+      if(!toHost(r,{type:'remote_resolve',round,deadline,processMs:2000,resolutionToken:r.resolutionToken})){
+        r.status='paused';
+        r.resolving=false;r.resolveRound=null;r.resolutionToken=null;r.resolutionResultReceived=false;
+        r.resolvingUntil=null;r.resolveStartedAt=null;
+        r.executeAt=null;r.ordersOpenAt=null;r.ordersCloseAt=null;
+        broadcast(r);persist(r);return;
+      }
+      r.resolveWatchdog=setTimeout(()=>{
+        if(!rooms.has(r.code)||r.status!=='playing'||!r.resolving||Number(r.resolveRound)!==round)return;
+        r.status='paused';
+        r.resolving=false;r.resolveRound=null;r.resolutionToken=null;r.resolutionResultReceived=false;
+        r.resolvingUntil=null;r.resolveStartedAt=null;r.executeAt=null;r.ordersOpenAt=null;r.ordersCloseAt=null;
+        broadcast(r);persist(r);
+      },15000);
+    },2000);
+  },delay);
+}
+
+function validateOrder(r,sideId,c){
+  const side=r.sides.find(s=>s.id===sideId); if(!side||!c||c.kind!=='order')return false;
+  const u=(r.fullState?.units||[]).find(x=>String(x.id)===String(c.id));
+  return !!u&&side.countries.includes(u.nation)&&['Guardar','Mover','Ataque','Reconhecimento'].includes(c.action);
+}
+app.get('/api/campaigns',(req,res)=>res.json({campaigns:campaignList()}));
+app.get('/api/campaigns/:code',(req,res)=>{const c=String(req.params.code).toUpperCase();const r=rooms.get(c);if(!r)return res.status(404).json({error:'Campanha não encontrada.'});saveCampaign(r);res.json(serializeRoom(r));});
+app.post('/api/campaigns/import',(req,res)=>{try{const d=req.body?.campaign||req.body;const r=d?.room;if(!r?.code||!Array.isArray(r.sides)||r.sides.length<2)return res.status(400).json({error:'Arquivo de campanha inválido.'});let c=String(r.code).toUpperCase();if(rooms.has(c)){let i=2,base=c;while(rooms.has(c))c=base+'-'+i++;r.code=c;}r.fog=true;r.isCampaign=true;r.resumeSavedStatus=String(r.status||'playing');r.resumePending=true;r.timer=null;r.resolving=false;r.resolvingUntil=null;r.resolveRound=null;r.resolutionToken=null;r.resolutionResultReceived=false;r.awaitingNextRound=false;r.nextRoundReady={};r.placementCommitPending=false;r.placementUnitsBySide={};r.setupTerritoryOwners=r.setupTerritoryOwners||{};r.treaties=r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}};r.warStats=r.warStats||{committedBySide:{},killedBySide:{},registeredUnits:{}};ensureWarStats(r);r.hostConnected=false;r.hostAttached=false;r.sides.forEach(s=>{s.connected=false;s.ready=false;});if(r.status!=='finished')r.status='lobby';rooms.set(c,r);saveCampaign(r);res.json({ok:true,config:publicConfig(r),hostToken:r.hostToken});}catch(e){res.status(400).json({error:'Não foi possível importar a campanha.'});}});
+app.delete('/api/campaigns/:code',(req,res)=>{const c=String(req.params.code).toUpperCase();const r=rooms.get(c);if(!r)return res.status(404).json({error:'Campanha não encontrada.'});if(r.timer)clearTimeout(r.timer);if(r.resolveWatchdog)clearTimeout(r.resolveWatchdog);rooms.delete(c);try{fs.unlinkSync(campaignPath(c));}catch{};for(const [ws,p] of peers){if(p.roomCode===c){send(ws,{type:'error',message:'A campanha foi excluída.'});try{ws.close();}catch{}}}res.json({ok:true});});
+app.post('/api/campaigns/:code/save',(req,res)=>{const c=String(req.params.code).toUpperCase();const r=rooms.get(c);if(!r)return res.status(404).json({error:'Campanha não encontrada.'});if(String(req.body?.token||'')!==String(r.hostToken||''))return res.status(403).json({error:'Apenas o anfitrião pode salvar a campanha.'});const snap=req.body?.snapshot;if(snap&&Array.isArray(snap.units)){r.fullState={...(r.fullState||{}),units:snap.units.map(normalizeUnitForServer).filter(Boolean),territoryOwners:sanitizeTerritoryOwners(snap.territoryOwners||r.setupTerritoryOwners||{}),reconIntel:snap.reconIntel&&typeof snap.reconIntel==='object'?snap.reconIntel:{},log:Array.isArray(snap.log)?snap.log.slice(-160):[]};r.setupTerritoryOwners=sanitizeTerritoryOwners(r.fullState.territoryOwners||r.setupTerritoryOwners||{});r.fullState.round=r.round;registerWarUnits(r,r.fullState.units);}const ok=saveCampaign(r);if(!ok)return res.status(500).json({error:'Não foi possível gravar a campanha no disco.'});res.json({ok:true,savedAt:Date.now(),code:c});});
+
+app.get('/api/campaigns/:code/export',(req,res)=>{const c=String(req.params.code).toUpperCase();const r=rooms.get(c);if(!r)return res.status(404).json({error:'Campanha não encontrada.'});const data=JSON.stringify(serializeRoom(r),null,2);res.setHeader('Content-Type','application/json');res.setHeader('Content-Disposition',`attachment; filename="${c}.krieg.json"`);res.send(data);});
+
+app.post('/api/rooms',(req,res)=>{
+  const sides=cleanSides(req.body?.sides);
+  if(sides.length<2)return res.status(400).json({error:'Configure pelo menos 2 lados.'});
+  const used=new Set(); for(const s of sides)for(const n of s.countries){if(used.has(n))return res.status(400).json({error:`O país ${n} está em mais de um lado.`});used.add(n);}
+  const duration=normalizeDuration(req.body?.orderDuration,req.body?.orderUnit);
+  let c; do c=code(); while(rooms.has(c));
+  const hostToken=token();
+  const setupTerritoryOwners=sanitizeTerritoryOwners(req.body?.territoryOwners);
+  const r={code:c,name:String(req.body?.name||'Minecraft Empires').slice(0,60),fog:true,round:1,status:'lobby',sides,fullState:null,setupTerritoryOwners,hostConnected:true,hostAttached:false,createdAt:Date.now(),hostToken,orderDurationMs:duration,ordersOpenAt:null,ordersCloseAt:null,executeAt:null,resolvingUntil:null,resolveRound:null,placementCommitPending:false,resolutionToken:null,resolutionResultReceived:false,awaitingNextRound:false,nextRoundReady:{},placementUnitsBySide:{},ordersBySide:{},treaties:{telegrams:[],truce:null,peace:null,resumeReady:{}},warStats:{committedBySide:{},killedBySide:{},registeredUnits:{}}};
+  const s1=r.sides.find(s=>s.id==='S1');if(s1)s1.connected=true;
+  rooms.set(c,r);res.json({code:c,hostToken,config:publicConfig(r)});
+});
+app.post('/api/rooms/:code/start',(req,res)=>{
+  const r=rooms.get(String(req.params.code).toUpperCase());
+  if(!r)return res.status(404).json({error:'Sala não encontrada.'});
+  if(String(req.body?.token||'')!==String(r.hostToken||''))return res.status(403).json({error:'Token do anfitrião inválido.'});
+  const s1=r.sides.find(s=>s.id==='S1');
+  if(!s1)return res.status(400).json({error:'O Lado 1 do anfitrião não existe.'});
+  syncConnections(r);
+  const s2=r.sides.filter(s=>s.id!=='S1');
+  if(r.status==='playing'||r.status==='placement'){
+    const fake={roomCode:r.code,sideId:'S1',role:'host'};
+    return res.json({ok:true,state:visibleState(r,fake)});
+  }
+  if(r.status!=='lobby')return res.status(409).json({error:'A sala não está no lobby.'});
+  if(!r.hostConnected)return res.status(409).json({error:'O anfitrião não está conectado.'});
+  if(r.sides.length!==2 || !s2[0]?.connected)return res.status(409).json({error:'O Lado 2 ainda não está conectado.'});
+  // A versão enviada pelo anfitrião é a autoridade para o mapa inicial.
+  const incomingTerritories=sanitizeTerritoryOwners(req.body?.territoryOwners);
+  if(Object.keys(incomingTerritories).length) r.setupTerritoryOwners=incomingTerritories;
+  r.status='placement';
+  r.resolutionToken=null; r.resolutionResultReceived=false;
+  r.awaitingNextRound=false; r.nextRoundReady={};
+  r.placementCommitPending=false;
+  r.sides.forEach(x=>x.ready=false);
+  if(!r.fullState)r.fullState={units:[],territoryOwners:r.setupTerritoryOwners||{},reconIntel:{},log:[]};
+  r.placementUnitsBySide={};
+  (r.fullState.units||[]).forEach(u=>{u.positionLocked=false;u.positionRound=null;});
+  persist(r);
+  broadcast(r);
+  const fake={roomCode:r.code,sideId:'S1',role:'host'};
+  res.json({ok:true,state:visibleState(r,fake)});
+});
+app.get('/api/rooms/:code/status',(req,res)=>{
+  const r=rooms.get(String(req.params.code).toUpperCase());
+  if(!r)return res.status(404).json({error:'Sala não encontrada.'});
+  syncConnections(r);
+  res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.json({code:r.code,name:r.name,status:r.status,round:r.round,orderDurationMs:r.orderDurationMs,ordersOpenAt:r.ordersOpenAt,ordersCloseAt:r.ordersCloseAt,executeAt:r.executeAt,resolving:!!r.resolving,resolvingUntil:r.resolvingUntil||null,placementReady:r.sides.map(s=>({id:s.id,ready:!!s.ready})),warReport:r.fullState?.warReport||null,treaties:{telegrams:(r.treaties?.telegrams||[]).slice(-100),truce:r.treaties?.truce||null,peace:r.treaties?.peace||null,resumeReady:r.treaties?.resumeReady||{}},sides:r.sides.map(s=>({id:s.id,name:s.name,alliance:s.alliance,countries:s.countries,connected:!!s.connected,ready:!!s.ready}))});
+});
+app.get('/api/rooms/:code',(req,res)=>{const r=rooms.get(String(req.params.code).toUpperCase());if(!r)return res.status(404).json({error:'Sala não encontrada.'});syncConnections(r);res.json(publicConfig(r));});
+
+function treatySidePayload(r, sideId){
+  const s=r.sides.find(x=>x.id===sideId); return s?{id:s.id,name:s.name}:null;
+}
+function treatyText(v,max=6000){return String(v??'').trim().slice(0,max);}
+function ensureWarStats(r){
+  const blank={committedBySide:{},killedBySide:{},registeredUnits:{}};
+  r.warStats=r.warStats||blank;
+  r.warStats.committedBySide=r.warStats.committedBySide||{};
+  r.warStats.killedBySide=r.warStats.killedBySide||{};
+  r.warStats.registeredUnits=r.warStats.registeredUnits||{};
+  for(const side of (r.sides||[])){
+    if(!Number.isFinite(Number(r.warStats.committedBySide[side.id])))r.warStats.committedBySide[side.id]=0;
+    if(!Number.isFinite(Number(r.warStats.killedBySide[side.id])))r.warStats.killedBySide[side.id]=0;
+  }
+  return r.warStats;
+}
+function sideIdForNation(r,nation){const s=(r.sides||[]).find(x=>Array.isArray(x.countries)&&x.countries.includes(nation));return s?.id||null;}
+function registerWarUnits(r, units){
+  const st=ensureWarStats(r);
+  for(const u of (Array.isArray(units)?units:[])){
+    if(u?.pendingRegistration)continue;
+    const id=String(u.id||''); if(!id)continue;
+    const sid=sideIdForNation(r,u.nation); if(!sid)continue;
+    const qty=Math.max(0,Math.floor(Number(u.initialQuantity ?? u.quantity)||0));
+    const prev=st.registeredUnits[id];
+    if(prev==null){st.registeredUnits[id]={sideId:sid,initialQuantity:qty};st.committedBySide[sid]=(Number(st.committedBySide[sid])||0)+qty;}
+    else if(qty>Number(prev.initialQuantity||0)){const delta=qty-Number(prev.initialQuantity||0);prev.initialQuantity=qty;st.committedBySide[sid]=(Number(st.committedBySide[sid])||0)+delta;}
+  }
+}
+function recordWarCasualties(r, beforeUnits, afterUnits){
+  const st=ensureWarStats(r);
+  const after=new Map((Array.isArray(afterUnits)?afterUnits:[]).map(u=>[String(u.id),u]));
+  for(const old of (Array.isArray(beforeUnits)?beforeUnits:[])){
+    const id=String(old?.id||''); if(!id)continue;
+    const sid=sideIdForNation(r,old.nation); if(!sid)continue;
+    const beforeQty=Math.max(0,Math.floor(Number(old.quantity)||0));
+    const now=after.get(id);
+    const afterQty=now?Math.max(0,Math.floor(Number(now.quantity)||0)):0;
+    const lost=Math.max(0,beforeQty-afterQty);
+    if(lost>0)st.killedBySide[sid]=(Number(st.killedBySide[sid])||0)+lost;
+  }
+}
+function warReport(r){
+  const fs=r.fullState||{}; const units=Array.isArray(fs.units)?fs.units:[]; const st=ensureWarStats(r); registerWarUnits(r,units);
+  const committedTotal=Object.values(st.committedBySide).reduce((a,v)=>a+(Number(v)||0),0);
+  const killedTotal=Object.values(st.killedBySide).reduce((a,v)=>a+(Number(v)||0),0);
+  const survivors={}; r.sides.forEach(s=>{survivors[s.id]={side:s.name,countries:s.countries,units:units.filter(u=>s.countries.includes(u.nation)&&Number(u.quantity)>0).length};});
+  const sides=r.sides.map(s=>({id:s.id,name:s.name,alliance:s.alliance,countries:s.countries,soldiersInvolved:Number(st.committedBySide[s.id]||0),soldiersKilled:Number(st.killedBySide[s.id]||0)}));
+  return {createdAt:Date.now(),round:Number(r.round||1),status:'finished',sides,territories:{},survivors,telegrams:(r.treaties?.telegrams||[]).length,soldiersInvolved:committedTotal,soldiersKilled:killedTotal,text:`RELATÓRIO FINAL DA GUERRA\nRodadas encerradas: ${Number(r.round||1)}\nSoldados envolvidos: ${committedTotal}\nSoldados mortos: ${killedTotal}\nTelegramas trocados: ${(r.treaties?.telegrams||[]).length}.`};
+}
+function clearRoundTimers(r){if(r.timer)clearTimeout(r.timer);if(r.resolveWatchdog)clearTimeout(r.resolveWatchdog);r.timer=null;r.resolveWatchdog=null;r.resolving=false;r.resolveRound=null;r.resolutionToken=null;r.resolutionResultReceived=false;r.resolvingUntil=null;r.resolveStartedAt=null;r.executeAt=null;r.ordersOpenAt=null;r.ordersCloseAt=null;}
+
+wss.on('connection',(ws)=>{
+  const player={roomCode:null,sideId:null,role:'guest'}; peers.set(ws,player); send(ws,{type:'hello'});
+  ws.on('message',(raw)=>{
+    let m;try{m=JSON.parse(raw.toString())}catch{return send(ws,{type:'error',message:'Mensagem inválida.'});}
+    if(m.type==='host_attach'){
+      const r=rooms.get(String(m.code||'').toUpperCase());
+      if(!r)return send(ws,{type:'error',message:'Sala não encontrada.'});
+      if(m.token!==r.hostToken)return send(ws,{type:'error',message:'Token do anfitrião inválido.'});
+      if(String(m.sideId||'')!=='S1')return send(ws,{type:'error',message:'O anfitrião deve obrigatoriamente ocupar o Lado 1.'});
+      const anotherHost=[...peers.entries()].some(([other,op])=>other!==ws&&op.roomCode===r.code&&op.role==='host');
+      if(anotherHost)return send(ws,{type:'error',message:'Já existe um anfitrião conectado nesta batalha.'});
+      player.roomCode=r.code;player.sideId='S1';player.role='host';r.hostAttached=true;r.hostConnected=true;
+      const s=r.sides.find(x=>x.id==='S1');if(s)s.connected=true;
+      if(r.status==='playing'){if(r.executeAt&&Date.now()>=r.executeAt)send(ws,{type:'remote_resolve',round:r.round,deadline:r.executeAt});else scheduleResolution(r);}
+      send(ws,{type:'joined',state:visibleState(r,player)});broadcast(r);return;
+    }
+    if(m.type==='campaign_join'){
+      const r=rooms.get(String(m.code||'').toUpperCase());
+      if(!r||!r.isCampaign)return send(ws,{type:'error',message:'Campanha não encontrada ou indisponível.'});
+      const side=r.sides.find(s=>s.id===m.sideId);
+      if(!side)return send(ws,{type:'error',message:'Lado inválido.'});
+      if(String(m.password||'')==='' || sha(m.password||'')!==side.passwordHash)return send(ws,{type:'error',message:'Senha incorreta.'});
+      if(side.id==='S1'){
+        for(const [oldSock,op] of peers){
+          if(oldSock!==ws && op.roomCode===r.code && op.sideId==='S1'){try{send(oldSock,{type:'replaced_connection',message:'Reconexão do Lado 1 efetuada por outra sessão.'});oldSock.close();}catch{}}
+        }
+      }else{
+        const existing=[...peers.entries()].some(([sock,p])=>sock!==ws&&p.roomCode===r.code&&p.sideId===side.id);
+        if(existing)return send(ws,{type:'error',message:'Este lado já está conectado.'});
+      }
+      player.roomCode=r.code;player.sideId=side.id;player.role=side.id==='S1'?'host':'guest';side.connected=true;
+      if(player.role==='host'){r.hostAttached=true;r.hostConnected=true;}
+      if(r.resumePending)r.resumeLastJoinAt=Date.now();
+      tryResumeCampaign(r);
+      send(ws,{type:'campaign_joined',state:visibleState(r,player)});
+      broadcast(r);
+      return;
+    }
+    if(m.type==='join'){
+      const r=rooms.get(String(m.code||'').toUpperCase());if(!r)return send(ws,{type:'error',message:'Sala não encontrada.'});
+      const side=r.sides.find(s=>s.id===m.sideId);if(!side)return send(ws,{type:'error',message:'Lado inválido.'});
+      if(String(m.password||'')==='' || sha(m.password||'')!==side.passwordHash)return send(ws,{type:'error',message:'Senha incorreta.'});
+      const existing=[...peers.entries()].filter(([sock,p])=>sock!==ws&&p.roomCode===r.code&&p.sideId===side.id);
+      if(existing.length && !(r.isCampaign && side.id==='S1')) return send(ws,{type:'error',message:'Este lado já está conectado.'});
+      if(side.id==='S1'&&!r.isCampaign)return send(ws,{type:'error',message:'O Lado 1 é reservado ao anfitrião que criou a batalha.'});
+      if(r.isCampaign && side.id==='S1' && existing.length){
+        for(const [oldSock] of existing){try{send(oldSock,{type:'replaced_connection',message:'Reconexão do anfitrião efetuada por outra sessão.'});oldSock.close();}catch{}}
+      }
+      if(r.isCampaign && r.resumePending) r.resumeLastJoinAt=Date.now();
+      if(r.status==='finished')return send(ws,{type:'error',message:'A partida já terminou.'});
+      player.roomCode=r.code;player.sideId=side.id;player.role=side.id==='S1'?'host':'guest';side.connected=true;
+      if(player.role==='host'){r.hostAttached=true;r.hostConnected=true;}
+      if(r.isCampaign) tryResumeCampaign(r);
+      send(ws,{type:'joined',state:visibleState(r,player)});broadcast(r);return;
+    }
+    if(!player.roomCode)return send(ws,{type:'error',message:'Entre em uma sala primeiro.'});
+    const r=rooms.get(player.roomCode);if(!r)return;
+    if(m.type==='host_territory_setup'&&player.role==='host'){
+      if(r.status==='playing')return send(ws,{type:'error',message:'A partida já começou; a configuração inicial de territórios está bloqueada.'});
+      r.setupTerritoryOwners=sanitizeTerritoryOwners(m.territoryOwners);
+      persist(r);broadcast(r);return;
+    }
+    if(m.type==='host_refresh'&&player.role==='host'){
+      syncConnections(r);
+      broadcast(r);
+      send(ws,{type:'refresh_ok',state:visibleState(r,player)});
+      return;
+    }
+    if(m.type==='host_start'&&player.role==='host'){
+      syncConnections(r);
+      if(r.status==='playing'){send(ws,{type:'game_started',state:visibleState(r,player)});return;}
+      if(r.status==='placement'){send(ws,{type:'placement_started',state:visibleState(r,player)});return;}
+      if(r.status!=='lobby')return send(ws,{type:'error',message:'A sala não está disponível para iniciar agora.'});
+      if(!r.hostConnected)return send(ws,{type:'error',message:'O anfitrião não está conectado.'});
+      const connectedSides=r.sides.filter(s=>s.connected);
+      if(connectedSides.length<2)return send(ws,{type:'error',message:`É necessário 2 lados conectados. Atualmente: ${connectedSides.length}.`});
+      r.status='placement'; r.placementCommitPending=false; r.sides.forEach(s=>s.ready=false);
+      if(!r.fullState)r.fullState={units:[],territoryOwners:r.setupTerritoryOwners||{},reconIntel:{},log:[]};
+  r.placementUnitsBySide={};
+  (r.fullState.units||[]).forEach(u=>{u.positionLocked=false;u.positionRound=null;});
+      persist(r);broadcast(r);
+      for(const [sock,p] of peers){if(p.roomCode===r.code)send(sock,{type:'placement_started',state:visibleState(r,p)});}
+      return;
+    }
+    if(m.type==='room_sync_request'){
+      syncConnections(r);
+      send(ws,{type:'room_sync',state:visibleState(r,player)});
+      return;
+    }
+    if(m.type==='placement_ready'&&player.role==='guest'){
+      if(r.status!=='placement')return send(ws,{type:'error',message:'A fase de posicionamento não está ativa.'});
+      const side=sideFor(r,player);if(!side)return send(ws,{type:'error',message:'Lado inválido.'});
+      side.ready=true;
+      const submitted=Array.isArray(m.units)?m.units.map(normalizeUnitForServer).filter(Boolean):[];
+      r.placementUnitsBySide[side.id]=submitted.filter(u=>side.countries.includes(u.nation)).map(u=>({...u,positionLocked:true,positionRound:null}));
+      syncConnections(r);broadcast(r);
+      if(r.sides.length===2&&r.sides.every(s=>s.connected&&s.ready)&&!r.placementCommitPending){
+        r.placementCommitPending=true;
+        if(!toHost(r,{type:'placement_commit',round:r.round,unitsBySide:r.placementUnitsBySide}))r.placementCommitPending=false;
+      }
+      return;
+    }
+    if(m.type==='host_placement_ready'&&player.role==='host'){
+      if(r.status!=='placement')return send(ws,{type:'error',message:'A fase de posicionamento não está ativa.'});
+      const side=r.sides.find(s=>s.id==='S1');if(!side)return;
+      side.ready=true;
+      const submitted=Array.isArray(m.units)?m.units.map(normalizeUnitForServer).filter(Boolean):[];
+      r.placementUnitsBySide[side.id]=submitted.filter(u=>side.countries.includes(u.nation)).map(u=>({...u,positionLocked:true,positionRound:null}));
+      syncConnections(r);broadcast(r);
+      if(r.sides.length===2&&r.sides.every(s=>s.connected&&s.ready)&&!r.placementCommitPending){
+        r.placementCommitPending=true;
+        if(!toHost(r,{type:'placement_commit',round:r.round,unitsBySide:r.placementUnitsBySide}))r.placementCommitPending=false;
+      }
+      return;
+    }
+    if(m.type==='host_placement_done'&&player.role==='host'){
+      if(r.status!=='placement'||!r.placementCommitPending)return;
+      r.fullState={units:Array.isArray(m.units)?m.units.map(normalizeUnitForServer).filter(Boolean):[],territoryOwners:m.territoryOwners||r.setupTerritoryOwners||{},reconIntel:{},log:Array.isArray(m.log)?m.log.slice(-160):[]};
+      r.fullState.units.forEach(u=>{u.positionLocked=true;u.positionRound=null;});
+      registerWarUnits(r,r.fullState.units);
+      // A posição final confirmada é a posição oficial da unidade.
+      // O Scout só atualiza a inteligência durante o processamento da rodada.
+      r.placementCommitPending=false;r.sides.forEach(s=>s.ready=false);
+      r.placementUnitsBySide={};
+      startRound(r);
+      for(const [sock,p] of peers){if(p.roomCode===r.code)send(sock,{type:'game_started',state:visibleState(r,p)});}
+      return;
+    }
+    if(m.type==='host_snapshot'&&player.role==='host'){
+      // Durante a resolução somente host_resolve_done pode substituir o estado.
+      // Snapshots atrasados não podem sobrescrever o resultado de uma rodada.
+      // Enquanto aguarda a confirmação dos lados, o resultado da rodada também fica congelado.
+      if(r.resolving||r.awaitingNextRound) return;
+      const incomingUnits=Array.isArray(m.units)?m.units.map(normalizeUnitForServer).filter(Boolean):[];
+      const hostSide=r.sides.find(s=>s.id==='S1');
+      const hostCountries=new Set(hostSide?.countries||[]);
+      const previousUnits=Array.isArray(r.fullState?.units)?r.fullState.units:[];
+      const incomingIds=new Set(incomingUnits.map(u=>String(u.id)));
+      // O host recebe uma visão limitada pelo Fog of War. Portanto, uma unidade do
+      // outro lado que não aparece no snapshot NÃO significa que ela foi removida.
+      // Mantemos essas unidades no estado autoritativo para que ordens do S2, saves
+      // e a próxima rodada nunca encontrem uma unidade "sumida".
+      const hiddenOpponentUnits=previousUnits.filter(u=>!hostCountries.has(u.nation)&&!incomingIds.has(String(u.id)));
+      const mergedUnits=incomingUnits.concat(hiddenOpponentUnits);
+      r.fullState={units:mergedUnits,territoryOwners:m.territoryOwners||r.setupTerritoryOwners||{},reconIntel:m.reconIntel||{},log:Array.isArray(m.log)?m.log.slice(-160):[]};
+      registerWarUnits(r,mergedUnits);
+      broadcast(r); persist(r);
+      return;
+    }
+    if(m.type==='host_resolve_done'&&player.role==='host'){
+      if(r.status!=='playing'||!r.resolving) return;
+      if(Number(m.round)!==Number(r.resolveRound)||String(m.resolutionToken||'')!==String(r.resolutionToken||'')) return;
+      if(r.resolutionResultReceived)return;
+      r.resolutionResultReceived=true;
+      const resolvedUnits=Array.isArray(m.units)?m.units.map(normalizeUnitForServer).filter(Boolean):[];
+      recordWarCasualties(r,r.fullState?.units||[],resolvedUnits);
+      registerWarUnits(r,resolvedUnits);
+      r.fullState={units:resolvedUnits,territoryOwners:m.territoryOwners||{},reconIntel:m.reconIntel||{},log:Array.isArray(m.log)?m.log.slice(-160):[]};
+      if(r.resolveWatchdog)clearTimeout(r.resolveWatchdog);
+      r.resolveWatchdog=null;
+      r.resolving=false;
+      r.resolvingUntil=null;
+      r.resolveRound=null;
+      r.resolveStartedAt=null;
+      r.resolutionToken=null;
+      r.resolutionResultReceived=false;
+      r.awaitingNextRound=true;
+      r.nextRoundReady={};
+      for(const [ws,p] of peers){
+        if(p.roomCode===r.code) send(ws,{type:'round_resolved',round:r.round,state:visibleState(r,p)});
+      }
+      broadcast(r);
+      persist(r);
+      return;
+    }
+    if(m.type==='confirm_next_round'){
+      if(r.status!=='playing'||!r.awaitingNextRound)return;
+      if(r.treaties?.truce||r.treaties?.peace)return send(ws,{type:'error',message:'Há um documento diplomático aguardando decisão. Abra TRATADOS para aceitar ou recusar.'});
+      const side=sideFor(r,player); if(!side)return;
+      r.nextRoundReady=r.nextRoundReady||{};
+      if(r.nextRoundReady[side.id])return;
+      r.nextRoundReady[side.id]=true;
+
+      const allConfirmed=r.sides.length===2 && r.sides.every(s=>!!r.nextRoundReady[s.id] && !!s.connected);
+      if(allConfirmed){
+        // A transição para a nova rodada é atômica: não fazemos um broadcast
+        // intermediário com awaitingNextRound=true depois que o segundo lado confirmou.
+        r.awaitingNextRound=false;
+        r.nextRoundReady={};
+        startRound(r,true);
+        for(const [sock,p] of peers){
+          if(p.roomCode===r.code){
+            send(sock,{type:'next_round_started',round:r.round,state:visibleState(r,p)});
+          }
+        }
+      }else{
+        // Apenas o primeiro clique precisa ser refletido na UI.
+        broadcast(r);
+        persist(r);
+      }
+      return;
+    }
+    if(m.type==='guest_command'&&player.role==='guest'){
+      if(r.status!=='playing'&&r.status!=='placement')return send(ws,{type:'error',message:'A partida ainda não começou.'});
+      const c=m.command;
+      if(c?.kind==='order'){
+        if(r.status!=='playing')return send(ws,{type:'error',message:'As ordens só começam após os dois lados confirmarem o posicionamento.'});
+        if(Date.now()>r.ordersCloseAt)return send(ws,{type:'error',message:'A janela de ordens desta rodada já fechou.'});
+        const side=sideFor(r,player);
+        const u=(r.fullState?.units||[]).find(x=>String(x.id)===String(c.id));
+        if(!side||!u||!side.countries.includes(u.nation))return send(ws,{type:'error',message:'Ordem inválida ou unidade não pertence ao seu lado.'});
+        // O servidor registra a ordem imediatamente no estado autoritativo e também
+        // a encaminha ao host para manter a simulação local sincronizada. O snapshot
+        // posterior do host nunca apaga unidades do outro lado.
+        u.action=String(c.action||'Nenhuma');
+        u.targetX=Number(c.targetX);
+        u.targetY=Number(c.targetY);
+        toHost(r,{type:'remote_command',fromSideId:player.sideId,command:c});
+        const o=r.ordersBySide[player.sideId]||(r.ordersBySide[player.sideId]={count:0,lastAt:null});o.count++;o.lastAt=Date.now();persist(r);broadcast(r);return;
+      }
+      if(c?.kind==='spawn'){if(r.status==='playing'&&Date.now()>r.ordersCloseAt)return send(ws,{type:'error',message:'Janela fechada.'});if(!c.nation||!sideFor(r,player)?.countries?.includes(c.nation))return send(ws,{type:'error',message:'País inválido para este lado.'});toHost(r,{type:'remote_command',fromSideId:player.sideId,command:{...c,clientId:String(c.clientId||'')}});return;}
+      if(c?.kind==='spawn_confirm'){
+        if(r.status!=='playing')return send(ws,{type:'error',message:'A confirmação de posicionamento só ocorre durante a batalha.'});
+        if(Date.now()>Number(r.ordersCloseAt||0))return send(ws,{type:'error',message:'A janela de posicionamento desta rodada já fechou.'});
+        const side=sideFor(r,player), incoming=c.unit&&typeof c.unit==='object'?normalizeUnitForServer(c.unit):null;
+        if(!side||!incoming||!side.countries.includes(incoming.nation))return send(ws,{type:'error',message:'Unidade inválida ou não pertence ao seu lado.'});
+        incoming.positionLocked=true; incoming.positionRound=null;
+        toHost(r,{type:'remote_command',fromSideId:player.sideId,command:{kind:'spawn_confirm',unit:incoming,clientId:String(c.clientId||incoming.id||'')}});
+        return;
+      }
+      if(c?.kind==='position_confirm'){
+        if(r.status!=='placement' && r.status!=='playing')return send(ws,{type:'error',message:'O posicionamento não está ativo.'});
+        const side=sideFor(r,player); if(!side)return send(ws,{type:'error',message:'Lado inválido.'});
+        const ids=Array.isArray(c.ids)?c.ids.map(String):[];
+        const own=(r.fullState?.units||[]).filter(u=>side.countries.includes(u.nation));
+        const validIds=new Set(ids);
+        if(!ids.length && own.some(u=>!u.positionLocked)) return send(ws,{type:'error',message:'Nenhuma unidade foi confirmada.'});
+        for(const u of own){
+          if(validIds.has(String(u.id))){
+            u.positionLocked=true;
+            u.positionRound=null;
+          }
+        }
+        toHost(r,{type:'remote_command',fromSideId:player.sideId,command:{kind:'position_confirm',ids}});
+        return;
+      }
+      if(c?.kind==='position'){
+        const side=sideFor(r,player),u=(r.fullState?.units||[]).find(x=>String(x.id)===String(c.id));
+        if(!side||!u||!side.countries.includes(u.nation))return send(ws,{type:'error',message:'Unidade inválida ou não pertence ao seu lado.'});
+        const x=Number(c.x),y=Number(c.y);
+        if(!Number.isFinite(x)||!Number.isFinite(y)||x<0||y<0||x>1600||y>900)return send(ws,{type:'error',message:'Posição inválida.'});
+        const allowedInPlacement=r.status==='placement';
+        const allowedNewRound=r.status==='playing' && !u.positionLocked && Number(u.positionRound)===Number(r.round) && Date.now()<=Number(r.ordersCloseAt||0);
+        if(!allowedInPlacement&&!allowedNewRound)return send(ws,{type:'error',message:'O posicionamento desta unidade já está bloqueado.'});
+        toHost(r,{type:'remote_command',fromSideId:player.sideId,command:{kind:'position',id:c.id,x,y}});return;
+      }
+      if(c?.kind==='edit'){if(r.status==='playing'&&Date.now()>r.ordersCloseAt)return send(ws,{type:'error',message:'Janela fechada.'});const side=sideFor(r,player);const u=(r.fullState?.units||[]).find(x=>String(x.id)===String(c.id));if(!side||!u||!side.countries.includes(u.nation))return send(ws,{type:'error',message:'Unidade inválida ou não pertence ao seu lado.'});if(c.field==='qty'){const q=Math.max(0,Math.floor(Number(c.value)||0));if(q>100000000)return send(ws,{type:'error',message:'Quantidade inválida.'});}if(c.field==='type'&&!CATALOG[c.value])return send(ws,{type:'error',message:'Tipo de tropa inválido.'});toHost(r,{type:'remote_command',fromSideId:player.sideId,command:c});return;}
+    }
+    if(m.type==='treaty_telegram'){
+      if(r.status!=='playing'||r.resolving)return send(ws,{type:'error',message:'Telegramas só podem ser enviados durante as ordens ou na pausa entre rodadas.'});
+      const side=sideFor(r,player),to=String(m.toSideId||''); if(!side)return;
+      const target=r.sides.find(s=>s.id===to); if(!target||target.id===side.id)return send(ws,{type:'error',message:'Destinatário inválido.'});
+      const body=treatyText(m.message); if(!body)return send(ws,{type:'error',message:'Escreva uma mensagem.'});
+      const rec={id:token(),fromSideId:side.id,fromSideName:side.name,toSideId:target.id,toSideName:target.name,message:body,createdAt:Date.now()};
+      r.treaties=r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}};r.treaties.telegrams=(r.treaties.telegrams||[]).concat(rec).slice(-100);
+      persist(r);broadcast(r);return;
+    }
+    if(m.type==='treaty_truce_propose'){
+      if(r.status!=='playing'||!r.awaitingNextRound)return send(ws,{type:'error',message:'A trégua só pode ser proposta ao final da rodada.'});
+      const side=sideFor(r,player),body=treatyText(m.text,8000);if(!side||!body)return send(ws,{type:'error',message:'Texto da trégua inválido.'});
+      r.treaties=r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}};
+      if(r.treaties.truce)return send(ws,{type:'error',message:'Já existe uma proposta de trégua.'});
+      r.treaties.truce={id:token(),proposedBy:side.id,proposedByName:side.name,text:body,createdAt:Date.now(),acceptedBy:{[side.id]:true}};
+      persist(r);broadcast(r);return;
+    }
+    if(m.type==='treaty_truce_accept'){
+      if(r.status!=='playing'||r.resolving||!r.awaitingNextRound)return;
+      const side=sideFor(r,player),t=r.treaties?.truce;if(!side||!t)return send(ws,{type:'error',message:'Nenhuma proposta de trégua ativa.'});
+      t.acceptedBy=t.acceptedBy||{};t.acceptedBy[side.id]=true;
+      const both=r.sides.length===2&&r.sides.every(s=>!!t.acceptedBy[s.id]);
+      if(both){clearRoundTimers(r);r.status='truce';r.awaitingNextRound=false;r.nextRoundReady={};r.treaties.resumeReady={};persist(r);broadcast(r);for(const [sock,p] of peers){if(p.roomCode===r.code)send(sock,{type:'truce_started',round:r.round,state:visibleState(r,p)});}}
+      else{persist(r);broadcast(r);}return;
+    }
+    if(m.type==='treaty_peace_propose'){
+      if(r.status!=='playing'||!r.awaitingNextRound)return send(ws,{type:'error',message:'O tratado de paz só pode ser proposto ao final da rodada.'});
+      const side=sideFor(r,player),body=treatyText(m.text,8000);if(!side||!body)return send(ws,{type:'error',message:'Texto do tratado inválido.'});
+      r.treaties=r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}};
+      if(r.treaties.peace)return send(ws,{type:'error',message:'Já existe uma proposta de paz.'});
+      r.treaties.peace={id:token(),proposedBy:side.id,proposedByName:side.name,text:body,createdAt:Date.now(),acceptedBy:{[side.id]:true}};
+      persist(r);broadcast(r);return;
+    }
+    if(m.type==='treaty_peace_accept'){
+      if(r.status!=='playing'||r.resolving||!r.awaitingNextRound)return;
+      const side=sideFor(r,player),t=r.treaties?.peace;if(!side||!t)return send(ws,{type:'error',message:'Nenhuma proposta de paz ativa.'});
+      t.acceptedBy=t.acceptedBy||{};t.acceptedBy[side.id]=true;
+      const both=r.sides.length===2&&r.sides.every(s=>!!t.acceptedBy[s.id]);
+      if(both){clearRoundTimers(r);r.status='finished';r.awaitingNextRound=false;r.nextRoundReady={};r.fullState={...(r.fullState||{}),warReport:warReport(r)};persist(r);broadcast(r);for(const [sock,p] of peers){if(p.roomCode===r.code)send(sock,{type:'peace_concluded',round:r.round,report:r.fullState.warReport,state:visibleState(r,p)});}}
+      else{persist(r);broadcast(r);}return;
+    }
+    if(m.type==='treaty_truce_reject'||m.type==='treaty_peace_reject'){
+      if(r.status!=='playing'||r.resolving||!r.awaitingNextRound)return;
+      const side=sideFor(r,player);const key=m.type==='treaty_truce_reject'?'truce':'peace';const t=r.treaties?.[key];
+      if(!side||!t)return send(ws,{type:'error',message:'Nenhuma proposta ativa para recusar.'});
+      if(t.proposedBy===side.id)return send(ws,{type:'error',message:'O autor da proposta não pode recusá-la como destinatário.'});
+      r.treaties[key]=null;persist(r);broadcast(r);return;
+    }
+    if(m.type==='resume_truce'){
+      if(r.status!=='truce')return;
+      const side=sideFor(r,player);if(!side)return; r.treaties=r.treaties||{telegrams:[],truce:null,peace:null,resumeReady:{}};r.treaties.resumeReady=r.treaties.resumeReady||{};r.treaties.resumeReady[side.id]=true;
+      const both=r.sides.length===2&&r.sides.every(s=>!!r.treaties.resumeReady[s.id]&&!!s.connected);
+      if(both){
+        r.treaties.resumeReady={};
+        r.treaties.truce=null;
+        r.nextRoundReady={};
+        r.awaitingNextRound=false;
+        r.resolving=false;
+        r.resolvingUntil=null;
+        r.resolveRound=null;
+        r.resolutionToken=null;
+        r.resolutionResultReceived=false;
+        r.status='playing';
+        startRound(r,true);
+        persist(r);
+        for(const [sock,p] of peers){if(p.roomCode===r.code)send(sock,{type:'truce_resumed',round:r.round,state:visibleState(r,p)});}
+      }
+      else{persist(r);broadcast(r);}return;
+    }
+        if(m.type==='host_event'&&player.role==='host'){r.status=m.status||r.status;if(m.log)r.fullState={...(r.fullState||{}),log:m.log};if(m.round)r.round=Number(m.round);broadcast(r);persist(r);return;}
+    if(m.type==='host_new_round'&&player.role==='host'){if(r.status==='lobby')startRound(r);return;}
+  });
+  ws.on('close',()=>{
+    const p=peers.get(ws);
+    peers.delete(ws);
+    if(!p?.roomCode)return;
+    const r=rooms.get(p.roomCode);
+    if(!r)return;
+    if(p.role==='host'){
+      const anotherHost=[...peers.values()].some(op=>op.roomCode===r.code&&op.role==='host');
+      if(!anotherHost){
+        r.hostConnected=false;
+        r.hostAttached=true;
+        const s1=r.sides.find(x=>x.id==='S1'); if(s1)s1.connected=false;
+        if(r.timer)clearTimeout(r.timer);
+        if(r.resolveWatchdog)clearTimeout(r.resolveWatchdog);
+        persist(r);
+        if(r.status==='playing')scheduleResolution(r);
+      }
+    }else{
+      const anotherSide=[...peers.values()].some(op=>op.roomCode===r.code&&op.sideId===p.sideId);
+      const s=r.sides.find(x=>x.id===p.sideId);
+      if(s&&!anotherSide)s.connected=false;
+    }
+    syncConnections(r);
+    broadcast(r);
+  });
+});
+
+setInterval(()=>{for(const r of rooms.values())persist(r);},15000);
+
+setInterval(()=>{const cutoff=Date.now()-24*60*60*1000;for(const [c,r] of rooms)if(r.createdAt<cutoff&&!r.hostConnected)rooms.delete(c);},30*60*1000);
+server.listen(PORT,()=>console.log(`Kriegspiel multiplayer on http://localhost:${PORT}`));
