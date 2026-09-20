@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: kriegspiel-multiplayer
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CAMPAIGN_DIR
+        value: /var/data/campaigns
+    disk:
+      name: kriegspiel-campaigns
+      mountPath: /var/data
+      sizeGB: 1

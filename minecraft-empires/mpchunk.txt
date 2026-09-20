@@ -1,0 +1,441 @@
+            name:el.querySelector('.mpSideName')?.value||`Lado ${i+1}`,
+            alliance:el.querySelector('.mpAlliance')?.value||`Aliança ${i+1}`,
+            countries:[...el.querySelectorAll('.mpNationCheck:checked')].map(o=>o.value),
+            password:el.querySelector('.mpSidePass')?.value||''
+          }));
+        }
+        async function mpCreateRoom(){
+          const msg=mpEl('mpCreateMsg');
+          const sides=mpCollectSides();
+          if(sides.length<2){msg.textContent='Configure pelo menos 2 lados.';return;}
+          const empty=sides.findIndex(s=>!s.countries.length);
+          if(empty>=0){msg.textContent=`O Lado ${empty+1} precisa ter pelo menos 1 país.`;return;}
+          const all=sides.flatMap(s=>s.countries);
+          if(new Set(all).size!==all.length){msg.textContent='Um país não pode pertencer a dois lados.';return;}
+          const duration=Math.max(1,Number(mpEl('mpDuration')?.value)||0);if(!duration){msg.textContent='Informe uma duração válida.';return;}
+          try{
+            const r=await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:mpEl('mpRoomName')?.value||'Minecraft Empires',sides,orderDuration:duration,orderUnit:mpEl('mpUnit')?.value||'m'})});
+            const d=await r.json();if(!r.ok)throw Error(d.error||'Erro ao criar sala');
+            MP.role='host';MP.sideId='S1';MP.token=d.hostToken;MP.room=d.config;MP.room.sides=(MP.room.sides||[]).map(s=>s.id==='S1'?{...s,connected:true}:s);MP.countries=(d.config.sides.find(s=>s.id==='S1')?.countries||[]);MP.alliedCountries=MP.countries.slice();
+            try{localStorage.setItem('krieg_mp_host',JSON.stringify({code:d.code,token:d.hostToken,sideId:'S1'}))}catch{}
+            MP.authenticated=false; MP.started=false; MP.connected=false;
+            // Entra no lobby imediatamente; a conexão WebSocket atualiza o status dos lados assim que abrir.
+            mpLobby({config:d.config,sideId:'S1',countries:MP.countries||[],alliedCountries:[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.config.round||1});
+            mpConnect(d.code,'S1','',d.hostToken);
+          }catch(e){msg.textContent=e.message;}
+        }
+        function mpJoinForm(){mpEl('mpHome').innerHTML=`<div style="display:grid;gap:12px"><label style="font-size:12px;color:#94a3b8">CÓDIGO DA SALA<input id="mpCode" maxlength="6" style="width:100%;margin-top:5px;text-transform:uppercase;background:#1e293b;border:1px solid #475569;color:white;border-radius:6px;padding:8px"></label><label style="font-size:12px;color:#94a3b8">LADO<select id="mpJoinSide" style="width:100%;margin-top:5px;background:#1e293b;border:1px solid #475569;color:white;border-radius:6px;padding:8px"><option>Use VER SALA</option></select></label><label style="font-size:12px;color:#94a3b8">SENHA DO LADO<input id="mpJoinPass" type="password" style="width:100%;margin-top:5px;background:#1e293b;border:1px solid #475569;color:white;border-radius:6px;padding:8px"></label><div style="display:flex;gap:8px"><button onclick="mpHome()" style="flex:1;padding:9px;background:#334155;color:white;border-radius:6px">Voltar</button><button onclick="mpLookupRoom()" style="flex:1;padding:9px;background:#475569;color:white;border-radius:6px">VER SALA</button><button onclick="mpJoinRoom()" style="flex:1.5;padding:9px;background:#0f766e;color:white;font-weight:900;border-radius:6px">ENTRAR</button></div><div id="mpJoinMsg" style="font-size:11px;color:#f87171"></div></div>`}
+        async function mpLookupRoom(){const c=(mpEl('mpCode').value||'').trim().toUpperCase();if(!c)return;try{const r=await fetch('/api/rooms/'+encodeURIComponent(c));const d=await r.json();if(!r.ok)throw Error(d.error);mpEl('mpJoinSide').innerHTML=d.sides.filter(s=>!s.connected).map(s=>`<option value="${s.id}">${mpEsc(s.name)} — ${mpEsc(s.countries.join(', '))} — ${mpEsc(s.alliance)}</option>`).join('')||'<option>Nenhum lado livre</option>';mpEl('mpJoinMsg').textContent=`${d.name} | ${d.sides.length} lados | Rodada ${d.round} | Tempo: ${mpFmt(d.orderDurationMs)}`;}catch(e){mpEl('mpJoinMsg').textContent=e.message}}
+        async function mpJoinRoom(){const c=(mpEl('mpCode').value||'').trim().toUpperCase(),side=mpEl('mpJoinSide').value;if(!c||!side)return;MP.role='guest';MP.sideId=side;MP.password=mpEl('mpJoinPass').value||'';MP.campaignAuth=false;mpConnect(c,side,MP.password,'')}
+        let mpWsConnectTimer=null;
+        function mpConnect(code,sideId,password,hostToken){
+          const proto=location.protocol==='https:'?'wss':'ws';
+          try{MP.ws?.close()}catch{}
+          MP.authenticated=false;MP.connected=false;
+          const ws=new WebSocket(`${proto}://${location.host}`); MP.ws=ws;
+          clearTimeout(mpWsConnectTimer);
+          mpWsConnectTimer=setTimeout(()=>{
+            if(ws.readyState===WebSocket.CONNECTING){
+              try{ws.close()}catch{}
+              MP.connected=false;MP.authenticated=false;
+              const st=mpEl('mpLobbyMsg'); if(st)st.textContent='WebSocket demorou para conectar. O lobby continua funcionando pelo servidor.';
+            }
+          },6000);
+          ws.onopen=()=>{
+            clearTimeout(mpWsConnectTimer);
+            MP.connected=true;
+            const auth=MP.campaignAuth?{type:'campaign_join',code,sideId,password}:(MP.role==='host'?{type:'host_attach',code,sideId:'S1',token:hostToken}:{type:'join',code,sideId,password});
+            ws.send(JSON.stringify(auth));
+          };
+          ws.onmessage=e=>{try{mpHandle(JSON.parse(e.data))}catch(err){console.error(err)}};
+          ws.onerror=()=>{MP.connected=false};
+          ws.onclose=()=>{
+            clearTimeout(mpWsConnectTimer);MP.connected=false;MP.authenticated=false;
+            const st=mpEl('mpStatus');if(st&&MP.room?.status!=='playing')st.textContent='CONEXÃO ENCERRADA';
+            if(MP.campaignAuth&&!MP.started){const x=mpEl('mpCampaignMsg');if(x&&!String(x.textContent||'').includes('Senha incorreta'))x.textContent='Conexão encerrada. Tentando reconectar...';}
+          };
+        }
+        // marca toda resposta de heartbeat para diagnóstico de conexões ociosas
+        
+
+
+        // Heartbeat de aplicação: mantém a sessão do navegador ativa mesmo quando o mapa
+        // fica sem interação por vários minutos. O servidor já responde a client_heartbeat.
+        let mpLastServerHeartbeat=Date.now();
+        setInterval(()=>{
+            if(typeof MP==='undefined'||!MP.authenticated||!MP.ws||MP.ws.readyState!==WebSocket.OPEN)return;
+            const now=Date.now();
+            try{MP.ws.send(JSON.stringify({type:'client_heartbeat',t:now}));}catch{}
+            if(now-mpLastServerHeartbeat>70000 && MP.started){
+                // Não derruba o jogo silenciosamente; força uma reconexão só se o socket já estiver fechado.
+                if(MP.ws.readyState===WebSocket.CLOSED){try{mpConnect(MP.room?.code,MP.sideId,MP.password||'',MP.token||'')}catch{}}
+            }
+        },20000);
+
+        function mpHandle(m){
+          if(m.type==='server_heartbeat'){mpLastServerHeartbeat=Date.now();return;}
+          if(m.type==='error'){const x=mpEl('mpResumeError')||mpEl('mpCampaignMsg')||mpEl('mpCreateMsg')||mpEl('mpJoinMsg')||mpEl('mpLobbyMsg');if(x)x.textContent=m.message;if(mpEl('mpTreatyOverlay')){const e=mpEl('mpTreatyBody');if(e)e.insertAdjacentHTML('afterbegin',`<div style="margin-bottom:10px;padding:8px;background:#7f1d1d;color:#fecaca;border-radius:6px;font-size:11px">${mpEsc(m.message)}</div>`)}MP.pendingStart=false;const b=document.querySelector('button[onclick=\"mpStartGame()\"]');if(b){b.disabled=false;b.textContent='INICIAR POSICIONAMENTO'}return}
+          if(m.type==='campaign_joined'){MP.room=m.state.config;MP.countries=m.state.countries;MP.alliedCountries=m.state.alliedCountries||MP.countries;MP.authenticated=true;MP.pendingStart=false;MP.campaignAuth=true;if(window.mpCampaignResumePollTimer){clearInterval(window.mpCampaignResumePollTimer);window.mpCampaignResumePollTimer=null;}mpStartTreatyPolling();if(m.state.authoritativeFullState && MP.role==='host') mpApplyAuthoritativeResumeState(m.state.authoritativeFullState);mpLobby(m.state);mpStartLobbyAutoRefresh();return;}
+          if(m.type==='joined'){
+            const shouldStart=!!MP.pendingStart && MP.role==='host';
+            MP.room=m.state.config;MP.countries=m.state.countries;MP.alliedCountries=m.state.alliedCountries||MP.countries;MP.authenticated=true;MP.pendingStart=false;
+            mpStartTreatyPolling();
+            if(m.state.authoritativeFullState && MP.role==='host') mpApplyAuthoritativeResumeState(m.state.authoritativeFullState);
+            if(m.state.config?.status==='playing'){mpStartLocal(m.state);}
+            else { mpLobby(m.state); if(shouldStart) setTimeout(()=>{if(MP.ws?.readyState===1&&MP.authenticated){const b=document.querySelector('button[onclick=\"mpStartGame()\"]');if(b){b.disabled=true;b.textContent='INICIANDO...'};MP.ws.send(JSON.stringify({type:'host_start'}));}},30); }
+            return;
+          }
+          if(m.type==='placement_started'){
+            MP.room=m.state.config;MP.countries=m.state.countries;MP.alliedCountries=m.state.alliedCountries||MP.countries;MP.pendingStart=false;mpStartPlacement(m.state);return;
+          }
+          if(m.type==='placement_commit'&&MP.role==='host'){
+            try{
+              const bySide=m.unitsBySide||{};
+              Object.entries(bySide).forEach(([sid,list])=>{
+                if(sid==='S1'||!Array.isArray(list))return;
+                list.forEach(incoming=>{if(!incoming)return;const id=String(incoming.id);if(!units.some(u=>String(u.id)===id)){const nu=JSON.parse(JSON.stringify(incoming));nu.positionLocked=true;nu.positionRound=null;normalizeUnitHealthLocal(nu,true);units.push(nu);}else{const local=units.find(u=>String(u.id)===id);if(local){local.x=Number(incoming.x)||0;local.y=Number(incoming.y)||0;local.positionLocked=true;local.positionRound=null;normalizeUnitHealthLocal(local,true);}}});
+              });
+              units.forEach(u=>{u.positionLocked=true;u.positionRound=null;});
+              // Reconhecimento da posição FINAL confirmada: nunca reutilizar a
+              // coordenada de spawn que existia antes da confirmação.
+              units.filter(u=>u.action==='Reconhecimento').forEach(u=>{
+                const prev=activeNation; activeNation=u.nation; catalogReconnaissance(u); activeNation=prev;
+              });
+              MP.ws?.send(JSON.stringify({type:'host_placement_done',round:MP.room?.round||1,units:JSON.parse(JSON.stringify(units)),territoryOwners:JSON.parse(JSON.stringify(territoryOwners)),reconIntel:JSON.parse(JSON.stringify(reconIntel||{})),log:Array.from(document.querySelectorAll('#turnLog > *')).slice(0,160).map(x=>x.outerHTML)}));
+            }catch(e){console.error('Erro ao confirmar posicionamento:',e)}
+            return;
+          }
+          if(m.type==='game_started'){
+            MP.room=m.state.config;MP.countries=m.state.countries;MP.alliedCountries=m.state.alliedCountries||MP.countries;MP.pendingStart=false;
+            const b=document.querySelector('button[onclick=\"mpStartGame()\"]');if(b){b.disabled=true;b.textContent='PARTIDA INICIADA'}
+            mpStartLocal(m.state); return;
+          }
+          if(m.type==='refresh_ok'||m.type==='room_sync'){
+            MP.room=m.state.config;MP.alliedCountries=m.state.alliedCountries||MP.alliedCountries;MP.treatyState=m.state?.treaties||m.state?.config?.treaties||MP.treatyState;
+            if(m.state.config?.status==='placement'){if(!MP.placement)mpStartPlacement(m.state);else mpApplyPlacementState(m.state);return;}if(m.state.config?.status==='playing')mpStartLocal(m.state);else mpLobby(m.state);return;
+          }
+          if(m.type==='state'){
+            const incomingRound=Number(m.state?.config?.round||0),currentRound=Number(MP.room?.round||0);
+            if(currentRound>0&&incomingRound>0&&incomingRound<currentRound)return;
+            MP.room=m.state.config;MP.alliedCountries=m.state.alliedCountries||MP.countries;
+            if(m.state?.treaties)MP.treatyState=m.state.treaties; else if(m.state?.config?.treaties)MP.treatyState=m.state.config.treaties;
+            if(m.state.config?.status==='placement'){if(!MP.placement)mpStartPlacement(m.state);else mpApplyPlacementState(m.state);return;}
+            if(m.state.config?.status==='playing'){
+              mpStartTreatyPolling();
+              if(!m.state.config?.resolving)MP.resolvingRound=null;
+              if(!MP.started)mpStartLocal(m.state);else mpApplyState(m.state);
+            }else if(m.state.config?.status==='truce'){
+              MP.treatyState=m.state?.treaties||m.state?.config?.treaties||MP.treatyState;mpUpdateSaveButton();mpUpdateTimer();
+            }else if(m.state.config?.status==='finished'){
+              if(m.state.config?.warReport)mpShowWarReport(m.state.config.warReport);
+            }else mpLobby(m.state);return;
+          }
+          if(m.type==='round_resolved'){
+            if(m.state){
+              const incomingRound=Number(m.state.config?.round||0),currentRound=Number(MP.room?.round||0);
+              if(incomingRound>=currentRound){
+                MP.room=m.state.config;MP.alliedCountries=m.state.alliedCountries||MP.alliedCountries;MP.treatyState=m.state?.treaties||m.state?.config?.treaties||MP.treatyState;
+                MP.resolutionToken=null;MP.resolvingRound=null;MP.nextRoundConfirmed=false;
+                if(MP.started)mpApplyState(m.state);
+              }
+            }
+            return;
+          }
+          if(m.type==='next_round_started'){
+            if(m.state){
+              const incomingRound=Number(m.state.config?.round||m.round||0),currentRound=Number(MP.room?.round||0);
+              if(incomingRound>=currentRound){
+                MP.room=m.state.config;
+                MP.alliedCountries=m.state.alliedCountries||MP.alliedCountries;MP.treatyState=m.state?.treaties||m.state?.config?.treaties||MP.treatyState;
+                MP.nextRoundConfirmed=false;MP.resolutionToken=null;MP.resolvingRound=null;
+                if(MP.started)mpApplyState(m.state);
+                else mpStartLocal(m.state);
+                mpUpdateNextRoundButton();
+                mpUpdateTimer();
+              }
+            }
+            return;
+          }
+          if(m.type==='truce_started'||m.type==='truce_resumed'||m.type==='peace_concluded'){
+            if(m.state){
+              MP.room=m.state.config;
+              MP.alliedCountries=m.state.alliedCountries||MP.alliedCountries;
+              MP.treatyState=m.state.treaties||MP.room.treaties||MP.treatyState;
+              mpApplyTreatyState(m.state);
+            }
+            if(m.type==='peace_concluded'){if(m.report)mpShowWarReport(m.report);}
+            if(m.type==='truce_started'){
+              mpShowTreatyNotice('TRÉGUA FIRMADA','A guerra foi suspensa e a campanha foi salva.');
+              mpUpdateSaveButton();mpUpdateTimer();
+            }
+            if(m.type==='truce_resumed'){
+              // Retomada da guerra: não chamamos mpStartLocal(), pois MP.started já é true
+              // e essa função retorna cedo. Aplicamos diretamente o novo estado da rodada.
+              MP.started=true;
+              MP.placement=false;
+              MP.placementReady=false;
+              MP.nextRoundConfirmed=false;
+              MP.resolutionToken=null;
+              MP.resolvingRound=null;
+              if(m.state){mpApplyState(m.state);}
+              mpStartTreatyPolling();
+              mpUpdateNextRoundButton();
+              mpUpdateTimer();
+              mpUpdateSaveButton();
+            }
+            return;
+          }
+          if(m.type==='remote_command'&&MP.role==='host'){mpApplyRemoteCommand(m.command,m.fromSideId);return;}
+          if(m.type==='remote_resolve'&&MP.role==='host'){if(MP.started&&MP.room?.status==='playing'&&Number(m.round)===Number(MP.room?.round)&&!MP.resolvingRound){MP.resolvingRound=Number(m.round);MP.resolutionToken=m.resolutionToken||null;MP.room.resolving=true;MP.room.resolvingUntil=Date.now()+2000;try{processTurn();}catch(err){console.error('Erro ao resolver rodada:',err);MP.resolvingRound=null;}}return;}
+        }
+        function mpRenderLobby(state){
+          if(!mpEl('mpOverlay'))return;
+          const cfg=state.config;
+          const rows=cfg.sides.map(s=>`<div data-side-row="${s.id}" style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;border-bottom:1px solid #1e293b;padding:8px 0"><div><b style="color:#e2e8f0">${mpEsc(s.name)}</b><span style="font-size:10px;color:#64748b"> — ${mpEsc(s.countries.join(', '))}</span><div style="font-size:10px;color:#64748b">Aliança: ${mpEsc(s.alliance)}</div></div><span data-side-status="${s.id}" style="font-size:10px;color:${s.connected?'#4ade80':'#64748b'}">${s.connected?'● conectado':'○ aguardando'}</span><span style="font-size:10px;color:#94a3b8">${s.id==='S1'?'ANFITRIÃO':''}</span></div>`).join('');
+          mpEl('mpStatus').textContent=cfg.status==='playing'?'PARTIDA INICIADA':(cfg.status==='placement'?'POSICIONAMENTO INICIAL':'AGUARDANDO JOGADORES');
+          const hostCanStart=MP.role==='host'&&cfg.status!=='playing'&&cfg.status!=='placement';
+          const startLabel=cfg.status==='placement'?'POSICIONAMENTO EM ANDAMENTO':'INICIAR POSICIONAMENTO';
+          const hostButtons=hostCanStart?`<button id="mpStartBtn" onclick="mpStartGame()" style="flex:1;padding:10px;background:#4f46e5;color:white;font-weight:900;border-radius:7px">${startLabel}</button>`:'';
+          const html=`<div id="mpLobbyRoot" style="display:grid;gap:12px"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px"><div style="background:#020617;border:1px solid #334155;border-radius:8px;padding:10px"><div style="font-size:10px;color:#64748b">CÓDIGO</div><b style="font-size:20px;color:white;letter-spacing:.12em">${cfg.code}</b></div><div style="background:#020617;border:1px solid #334155;border-radius:8px;padding:10px"><div style="font-size:10px;color:#64748b">JANELA DE ORDENS</div><b style="color:#a5b4fc">${mpFmt(cfg.orderDurationMs)}</b></div><div style="background:#020617;border:1px solid #334155;border-radius:8px;padding:10px"><div style="font-size:10px;color:#64748b">NÉVOA</div><b style="color:#67e8f9">OBRIGATÓRIA</b></div></div><div style="background:#111827;border:1px solid #334155;border-radius:9px;padding:12px"><div style="font-size:12px;color:#cbd5e1;margin-bottom:4px">LOBBY DA PARTIDA</div><div id="mpSideRows">${rows}</div></div><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:#94a3b8"><span id="mpLobbyHint">${cfg.status==='playing'?'A rodada está ativa.':cfg.status==='placement'?'Os jogadores estão posicionando as tropas.':'O anfitrião pode iniciar quando o Lado 2 estiver conectado.'}</span><span id="mpAutoSyncState" style="font-size:10px;color:#67e8f9">● sincronização automática</span></div><div id="mpLobbyMsg" style="font-size:11px;color:#f87171"></div><div style="display:flex;gap:8px;flex-wrap:wrap">${hostButtons}<button id="mpRefreshBtn" type="button" onclick="window.mpManualRefreshRoom()" style="flex:1;padding:10px;background:#475569;color:white;font-weight:900;border-radius:7px">↻ ATUALIZAR</button><button onclick="navigator.clipboard?.writeText(location.href+'?room='+cfg.code)" style="flex:1;padding:10px;background:#334155;color:white;border-radius:6px">Copiar convite</button></div></div>`;
+          mpEl('mpHome').innerHTML=html;
+        }
+        function mpUpdateLobbyStatus(cfg){
+          if(!cfg)return;
+          MP.room=cfg;
+          const status=mpEl('mpStatus'); if(status)status.textContent=cfg.status==='playing'?'PARTIDA INICIADA':(cfg.status==='placement'?'POSICIONAMENTO INICIAL':'AGUARDANDO JOGADORES');
+          const hostHint=mpEl('mpLobbyHint'); if(hostHint)hostHint.textContent=cfg.status==='playing'?'A rodada está ativa.':cfg.status==='placement'?'Os jogadores estão posicionando as tropas.':'O anfitrião pode iniciar quando o Lado 2 estiver conectado.';
+          for(const side of (cfg.sides||[])){
+            const st=mpEl('mpSideRows')?.querySelector(`[data-side-status="${side.id}"]`);
+            if(st){st.textContent=side.connected?'● conectado':'○ aguardando';st.style.color=side.connected?'#4ade80':'#64748b';}
+          }
+          const hint=mpEl('mpAutoSyncState'); if(hint)hint.textContent=`● sincronizado ${new Date().toLocaleTimeString()}`;
+          const start=mpEl('mpStartBtn'); if(start && cfg.status==='playing'){start.disabled=true;start.textContent='PARTIDA INICIADA';}
+        }
+        function mpLobby(state){
+          if(!state?.config)return;
+          const cfg=state.config;
+          MP.room=cfg;
+          if(cfg.status==='placement'){if(!MP.placement)mpStartPlacement(state);else mpApplyPlacementState(state);return;}
+          if(cfg.status==='playing'){
+            if(mpLobbyPollTimer){clearInterval(mpLobbyPollTimer);mpLobbyPollTimer=null;}
+            mpStartLocal(state);return;
+          }
+          // Só reconstrói a interface quando realmente necessário.
+          const sameLobby=!!mpEl('mpLobbyRoot') && mpEl('mpSideRows');
+          if(sameLobby) mpUpdateLobbyStatus(cfg); else mpRenderLobby(state);
+          mpStartLobbyAutoRefresh();
+        }
+        let mpLobbyPollTimer=null;
+        let mpLobbyRefreshInFlight=false;
+        async function mpRefreshLobby(manual=false){
+          const code=String(MP.room?.code||'').trim().toUpperCase();
+          if(!code){const x=mpEl('mpLobbyMsg');if(x&&manual)x.textContent='Código da sala não encontrado.';return;}
+          // Clique manual nunca fica bloqueado por uma atualização anterior.
+          if(!manual&&mpLobbyRefreshInFlight)return;
+          mpLobbyRefreshInFlight=true;
+          const b=mpEl('mpRefreshBtn');
+          if(manual&&b){b.disabled=true;b.textContent='↻ CONSULTANDO...';}
+          const controller=new AbortController();
+          const timeout=setTimeout(()=>controller.abort(),7000);
+          try{
+            const r=await fetch('/api/rooms/'+encodeURIComponent(code)+'?t='+Date.now(),{method:'GET',cache:'no-store',headers:{'Cache-Control':'no-cache','Pragma':'no-cache'},signal:controller.signal});
+            let d=null;
+            try{d=await r.json();}catch{throw Error('O servidor respondeu com dados inválidos.');}
+            if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+            // Mantém sessão/localStorage atual e apenas atualiza o estado recebido.
+            MP.room=d;
+            if(d.status==='placement'){
+              const st={config:d,sideId:MP.sideId,countries:MP.countries||[],alliedCountries:MP.alliedCountries||[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.round||1};
+              if(!MP.placement)mpStartPlacement(st);else mpApplyPlacementState(st);
+            }else if(d.status==='playing'){
+              if(mpLobbyPollTimer){clearInterval(mpLobbyPollTimer);mpLobbyPollTimer=null;}
+              if(MP.ws?.readyState===1&&MP.authenticated){
+                try{MP.ws.send(JSON.stringify({type:'room_sync_request'}));}catch{}
+              }else if(!MP.started){
+                try{mpConnect(code,MP.sideId,MP.role==='guest'?(MP.password||''):'',MP.role==='host'?(MP.token||''):'');}catch{}
+              }
+              if(!MP.started){
+                const st={config:d,sideId:MP.sideId,countries:MP.countries||[],alliedCountries:MP.alliedCountries||[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.round||1};
+                mpStartLocal(st);
+              }
+            }else{
+              if(!mpEl('mpLobbyRoot'))mpRenderLobby({config:d,sideId:MP.sideId,countries:MP.countries||[],alliedCountries:MP.alliedCountries||[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.round||1});
+              mpUpdateLobbyStatus(d);
+            }
+            const x=mpEl('mpLobbyMsg');
+            if(x&&manual)x.textContent='✓ Sala atualizada às '+new Date().toLocaleTimeString();
+          }catch(e){
+            const x=mpEl('mpLobbyMsg');
+            if(x&&manual)x.textContent=e.name==='AbortError'?'O servidor demorou para responder. Tente novamente.':'Erro ao atualizar: '+e.message;
+          }finally{
+            clearTimeout(timeout);
+            mpLobbyRefreshInFlight=false;
+            if(manual&&b){b.disabled=false;b.textContent='↻ ATUALIZAR';}
+          }
+        }
+        function mpStartLobbyAutoRefresh(){
+          if(mpLobbyPollTimer)return;
+          mpLobbyPollTimer=setInterval(()=>{if(MP.room?.code&&!MP.started&&!MP.placement&&mpEl('mpOverlay'))mpRefreshLobby(false);},1000);
+          mpRefreshLobby(false);
+        }
+        window.mpRefreshLobby=()=>mpManualRefreshRoom();
+        window.mpManualRefreshRoom=async function(){
+          const code=String(MP.room?.code||'').trim().toUpperCase();
+          const msg=mpEl('mpLobbyMsg'),btn=mpEl('mpRefreshBtn');
+          if(!code){if(msg)msg.textContent='Código da sala não encontrado.';return;}
+          if(btn){btn.disabled=true;btn.textContent='↻ CONSULTANDO...';}
+          try{
+            const url='/api/rooms/'+encodeURIComponent(code)+'/status?t='+Date.now();
+            const r=await fetch(url,{method:'GET',cache:'no-store',headers:{'Accept':'application/json','Cache-Control':'no-cache'}});
+            const d=await r.json();
+            if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+            if(!d||!Array.isArray(d.sides))throw new Error('Resposta de status inválida.');
+            MP.room={...(MP.room||{}),...d};
+            if(d.status==='playing'){
+              if(msg)msg.textContent='✓ Partida iniciada. Sincronizando...';
+              if(MP.ws?.readyState===1&&MP.authenticated){try{MP.ws.send(JSON.stringify({type:'room_sync_request'}));}catch{}}
+              else if(!MP.started&&MP.sideId){try{mpConnect(code,MP.sideId,MP.role==='guest'?(MP.password||''):'',MP.role==='host'?(MP.token||''):'');}catch{}}
+              return;
+            }
+            if(d.status==='placement'){
+              if(!MP.placement){const st={config:d,sideId:MP.sideId,countries:MP.countries||[],alliedCountries:MP.alliedCountries||[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.round||1};mpStartPlacement(st);}
+              return;
+            }
+            if(!mpEl('mpLobbyRoot')){const st={config:d,sideId:MP.sideId,countries:MP.countries||[],alliedCountries:MP.alliedCountries||[],units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:d.round||1};mpRenderLobby(st);}
+            mpUpdateLobbyStatus(d);
+            if(msg)msg.textContent='✓ Sala atualizada às '+new Date().toLocaleTimeString();
+          }catch(e){
+            console.error('Falha ao atualizar sala:',e);
+            if(msg)msg.textContent='Erro ao atualizar: '+(e?.message||String(e));
+          }finally{
+            if(btn){btn.disabled=false;btn.textContent='↻ ATUALIZAR';}
+          }
+        };
+
+        function mpEnterTerritorySetup(){
+          if(MP.role!=='host'||MP.room?.status==='playing')return;
+          MP.territorySetup=true; territoryPaintMode=false; selectedTerritoryKey=null;
+          if(!territoryLand || !Object.keys(territoryLand).length){ buildTerritoryMask(); initializeTerritories(); }
+          // O anfitrião publica também os territórios pré-estabelecidos pelo mapa,
+          // mesmo que não tenha editado nenhum quadrante.
+          mpSendTerritorySetup();
+          const ov=mpEl('mpOverlay');if(ov)ov.remove();
+          const btn=mpEl('territoryPaintBtn');if(btn){btn.style.display='inline-flex';btn.textContent='Pintar Território';}
+          const panel=mpEl('territoryPanel');if(panel){panel.style.display='block';panel.classList.remove('hidden');}
+          populateTerritoryOwnerSelectors();updateTerritoryPanel();
+          let bar=mpEl('mpTerritorySetupBar');
+          if(!bar){bar=document.createElement('div');bar.id='mpTerritorySetupBar';bar.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9000;background:rgba(15,23,42,.97);border:1px solid #f59e0b;border-radius:9px;padding:9px 12px;box-shadow:0 10px 35px rgba(0,0,0,.45);display:flex;align-items:center;gap:10px;color:white;font-size:11px;max-width:95vw';document.body.appendChild(bar)}
+          bar.innerHTML=`<b style="color:#fbbf24">CONFIGURAÇÃO PRÉ-GUERRA</b><span style="color:#94a3b8">Clique em um território e escolha o país que começa controlando-o. Os territórios já vêm pré-selecionados pelo mapa.</span><button onclick="mpFinishTerritorySetup()" style="padding:7px 10px;background:#059669;color:white;font-weight:900;border-radius:6px;white-space:nowrap">✓ CONCLUIR</button>`;
+          draw();
+        }
+        function mpFinishTerritorySetup(){
+          if(MP.role!=='host')return;
+          MP.territorySetup=false;territoryPaintMode=false;selectedTerritoryKey=null;
+          mpEl('mpTerritorySetupBar')?.remove();
+          const panel=mpEl('territoryPanel');if(panel){panel.classList.add('hidden');panel.style.display='';}
+          const btn=mpEl('territoryPaintBtn');if(btn)btn.style.display='';
+          mpSendTerritorySetup();
+          mpModal();
+          mpLobby({config:MP.room,sideId:MP.sideId,countries:MP.countries,alliedCountries:MP.alliedCountries,units:[],territoryOwners:territoryOwners,reconIntel:{},log:[],round:MP.room?.round||1});
+        }
+        function mpSendTerritorySetup(){
+          if(MP.role!=='host'||!MP.ws||MP.ws.readyState!==1)return;
+          MP.ws.send(JSON.stringify({type:'host_territory_setup',territoryOwners:JSON.parse(JSON.stringify(territoryOwners))}));
+        }
+        function mpStartPlacement(state){
+          MP.placement=true;MP.placementReady=!!state.config?.placementReady?.find(x=>x.id===MP.sideId)?.ready;MP.started=false;MP.resolvingRound=null;
+          mpEl('mpPlacementBar')?.remove();const ov=mpEl('mpOverlay');if(ov)ov.remove();
+          const sel=mpEl('nationSelect');if(sel){sel.innerHTML=MP.countries.map(n=>`<option value="${mpEsc(n)}">${mpEsc(n)}</option>`).join('');sel.value=MP.countries[0]||'';sel.disabled=MP.countries.length<=1}activeNation=MP.countries[0]||activeNation;showFog=true;
+          const fog=mpEl('fogBtn');if(fog){fog.disabled=true;fog.innerText='Névoa: LIGADA'}
+          const end=document.querySelector('button[onclick="processTurn()"]');if(end){end.disabled=true;end.title='A resolução começa automaticamente após o posicionamento'}
+          let bar=document.createElement('div');bar.id='mpPlacementBar';bar.style.cssText='position:fixed;top:76px;left:50%;transform:translateX(-50%);z-index:9000;background:rgba(15,23,42,.97);border:1px solid #22d3ee;border-radius:9px;padding:9px 12px;box-shadow:0 10px 35px rgba(0,0,0,.45);display:flex;align-items:center;gap:10px;color:white;font-size:11px;max-width:95vw;flex-wrap:wrap';document.body.appendChild(bar);
+          bar.innerHTML=`<b style="color:#67e8f9">POSICIONAMENTO INICIAL</b><span style="color:#94a3b8">Arraste/crie suas tropas no local de início.</span><span id="mpPlacementStatus" style="color:#fbbf24"></span><button id="mpPlacementReadyBtn" onclick="mpSetPlacementReady()" style="padding:7px 10px;color:white;font-weight:900;border-radius:6px;white-space:nowrap"></button>`;
+          units.forEach(u=>normalizeUnitHealthLocal(u,true));
+          mpApplyPlacementState(state);if(MP.role==='host')setTimeout(mpSendSnapshot,50);
+        }
+        function mpApplyPlacementState(state){
+          if(state?.config){MP.room=state.config;MP.alliedCountries=state.alliedCountries||MP.alliedCountries;MP.placementReady=!!state.config.placementReady?.find(x=>x.id===MP.sideId)?.ready;}
+          mpRefreshAllianceCountries();
+          if(MP.role==='guest'){units=Array.isArray(state.units)?JSON.parse(JSON.stringify(state.units)):[];units.forEach(u=>normalizeUnitHealthLocal(u));const incomingTerritories=state.territoryOwners&&typeof state.territoryOwners==='object'?state.territoryOwners:{};if(Object.keys(incomingTerritories).length||!Object.keys(territoryOwners).length)territoryOwners=mergeTerritoryOwnersPreservingBase(incomingTerritories);selectedUnit=null;updateUnitDetail();territoryVisualsDirty=true;draw();}
+          else if(!MP.started&&state.territoryOwners){const incomingTerritories=state.territoryOwners&&typeof state.territoryOwners==='object'?state.territoryOwners:{};if(Object.keys(incomingTerritories).length||!Object.keys(territoryOwners).length){territoryOwners=mergeTerritoryOwnersPreservingBase(incomingTerritories);territoryVisualsDirty=true;draw();}}
+          const st=mpEl('mpPlacementStatus');if(st)st.textContent=(state?.config?.placementReady||[]).map(x=>`${x.id}: ${x.ready?'PRONTO':'POSICIONANDO'}`).join(' · ');
+          const b=mpEl('mpPlacementReadyBtn');if(b){b.disabled=MP.placementReady;b.textContent=MP.placementReady?'✓ PRONTO':'✓ ESTOU PRONTO';b.style.background=MP.placementReady?'#475569':'#059669';}
+        }
+        function mpSetPlacementReady(){
+          if(!MP.placement||!MP.authenticated||MP.placementReady)return;
+          const mine=units.filter(u=>mpCanControl(u));
+          mine.forEach(u=>{u.positionLocked=true;u.positionRound=null;});
+          MP.placementReady=true;
+          if(MP.role==='guest'){
+            MP.ws?.send(JSON.stringify({type:'guest_command',command:{kind:'position_confirm',ids:mine.map(u=>String(u.id))}}));
+            setTimeout(()=>MP.ws?.send(JSON.stringify({type:'placement_ready',units:mine.map(u=>JSON.parse(JSON.stringify(u)))})),100);
+          }else{
+            MP.ws?.send(JSON.stringify({type:'host_placement_ready',units:mine.map(u=>JSON.parse(JSON.stringify(u)))}));
+            setTimeout(()=>mpSendSnapshot(),20);
+          }
+          const b=mpEl('mpPlacementReadyBtn');if(b){b.disabled=true;b.textContent='✓ PRONTO';b.style.background='#475569';}
+        }
+        window.mpSetPlacementReady=mpSetPlacementReady;
+        function mpShowStartConfirm(){
+          if(mpEl('mpStartConfirm'))return;
+          const ov=document.createElement('div');ov.id='mpStartConfirm';ov.style.cssText='position:fixed;inset:0;z-index:10001;background:rgba(2,6,23,.86);display:flex;align-items:center;justify-content:center;padding:20px';
+          ov.innerHTML=`<div style="width:min(460px,94vw);background:#0f172a;border:1px solid #6366f1;border-radius:12px;padding:20px;box-shadow:0 20px 70px rgba(0,0,0,.6);color:white;text-align:center"><div style="font-size:18px;font-weight:900;letter-spacing:.04em">INICIAR BATALHA?</div><div style="font-size:12px;color:#94a3b8;margin:12px 0 18px">O lobby será encerrado e começará o <b style="color:#67e8f9">POSICIONAMENTO INICIAL</b>. Os dois lados deverão posicionar suas tropas e confirmar que estão prontos.</div><div style="display:flex;gap:8px;justify-content:center"><button onclick="mpCancelStartConfirm()" style="padding:9px 16px;background:#334155;color:white;border-radius:7px">CANCELAR</button><button onclick="mpConfirmStart()" style="padding:9px 16px;background:#4f46e5;color:white;font-weight:900;border-radius:7px">✓ CONFIRMAR E INICIAR</button></div><div id="mpStartConfirmMsg" style="font-size:11px;color:#f87171;margin-top:10px"></div></div>`;
+          document.body.appendChild(ov);
+        }
+        window.mpCancelStartConfirm=()=>mpEl('mpStartConfirm')?.remove();
+        window.mpConfirmStart=async function(){
+          if(MP.role!=='host'||!MP.room?.code)return;
+          const msg=mpEl('mpStartConfirmMsg'),b=document.querySelector('button[onclick="mpStartGame()"]');
+          if(b){b.disabled=true;b.textContent='PROCESSANDO...';}
+          if(msg)msg.textContent='Confirmando com o servidor...';
+          try{
+            if(!Object.keys(territoryOwners||{}).length){
+              if(!territoryMaskCanvas){buildTerritoryMask();}
+              if(!Object.keys(initialTerritoryOwners||{}).length){initializeTerritories();}
+              if(Object.keys(initialTerritoryOwners||{}).length) territoryOwners=Object.assign(Object.create(null),initialTerritoryOwners);
+            }
+            const r=await fetch('/api/rooms/'+encodeURIComponent(MP.room.code)+'/start',{method:'POST',headers:{'Content-Type':'application/json','Cache-Control':'no-cache'},body:JSON.stringify({token:MP.token,territoryOwners:JSON.parse(JSON.stringify(territoryOwners||{}))})});
+            const d=await r.json(); if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+            mpEl('mpStartConfirm')?.remove();
+            MP.room=d.state.config;MP.countries=d.state.countries;MP.alliedCountries=d.state.alliedCountries||MP.countries;
+            mpStartPlacement(d.state);
+          }catch(e){
+            if(msg)msg.textContent=e.message;
+            if(b){b.disabled=false;b.textContent='INICIAR POSICIONAMENTO';}
+          }
+        };
+        function mpStartGame(){
+          if(MP.role!=='host'||MP.started)return;
+          mpShowStartConfirm();
+        }
+        function mpStartLocal(state){if(MP.started)return;MP.placement=false;MP.placementReady=false;mpEl('mpPlacementBar')?.remove();MP.started=true;units.forEach(u=>{normalizeUnitHealthLocal(u);u.positionLocked=true;u.positionRound=null;});const ov=mpEl('mpOverlay');if(ov)ov.remove();const sel=mpEl('nationSelect');if(sel){sel.innerHTML=MP.countries.map(n=>`<option value="${mpEsc(n)}">${mpEsc(n)}</option>`).join('');sel.value=MP.countries[0];sel.disabled=MP.countries.length<=1}activeNation=MP.countries[0];showFog=true;const fog=mpEl('fogBtn');if(fog){fog.disabled=true;fog.innerText='Névoa: LIGADA'}const end=document.querySelector('button[onclick="processTurn()"]');if(end)end.style.display='none';if(MP.role!=='host'){const b=mpEl('territoryPaintBtn');if(b)b.style.display='none';const p=mpEl('territoryPanel');if(p)p.style.display='none'}mpApplyState(state);mpInstallTimer();if(MP.role==='host')setTimeout(mpSendSnapshot,500)}
+        function mpSnapshot(){const intel={};for(const n of Object.keys(reconIntel||{}))intel[n]=JSON.parse(JSON.stringify(reconIntel[n]||{}));const publicUnits=units.filter(u=>!u.pendingRegistration).map(u=>JSON.parse(JSON.stringify(u)));const snap={type:'host_snapshot',round:MP.room?.round||1,units:publicUnits,territoryOwners:JSON.parse(JSON.stringify(territoryOwners)),reconIntel:intel,log:Array.from(document.querySelectorAll('#turnLog > *')).slice(0,160).map(x=>x.outerHTML)};try{localStorage.setItem('krieg_mp_last_backup',JSON.stringify({savedAt:Date.now(),code:MP.room?.code||null,snapshot:snap}))}catch{}return snap}
+        function mpSendSnapshot(){if(MP.role!=='host'||!MP.ws||MP.ws.readyState!==1||MP.suppress)return;MP.ws.send(JSON.stringify(mpSnapshot()))}
+        function mpCensorEnemyMovementLogHtml(html){
+          if(!MP.authenticated||!html)return html||'';
+          const wrap=document.createElement('div');
+          wrap.innerHTML=String(html);
+          Array.from(wrap.children).forEach(el=>{
+            const text=el.textContent||'';
+            if(!text.includes(' moveu ')||!text.includes(' para ('))return;
+            const b=el.querySelector('b');
+            const nation=(b?.textContent||'').trim();
+            if(!nation||MP.countries.includes(nation))return;
+            el.innerHTML=el.innerHTML.replace(/\s+para\s+\([^)]*\)/,' para (LOCALIZAÇÃO CENSURADA)');
+          });
+          return wrap.innerHTML;
+        }
+        function mpApplyAuthoritativeResumeState(fs){
+          if(MP.role!=='host'||!fs)return;
+          units=Array.isArray(fs.units)?JSON.parse(JSON.stringify(fs.units)):[];
+          units.forEach(u=>normalizeUnitHealthLocal(u));
+          territoryOwners=mergeTerritoryOwnersPreservingBase(fs.territoryOwners||{});
+          Object.keys(reconIntel).forEach(k=>delete reconIntel[k]);
+          Object.assign(reconIntel,fs.reconIntel&&typeof fs.reconIntel==='object'?JSON.parse(JSON.stringify(fs.reconIntel)):{});
+          const box=mpEl('turnLog');
+          if(box&&Array.isArray(fs.log)) box.innerHTML=mpCensorEnemyMovementLogHtml(fs.log.join(''));
+          selectedUnit=null;updateUnitDetail();territoryVisualsDirty=true;draw();renderOrders();
+          if(MP.ws?.readyState===1){try{MP.ws.send(JSON.stringify({type:'host_resume_ack',round:Number(MP.room?.round||fs.round||1)}));}catch{}}
+        }
+        function mpApplyState(s){
+          if(!s)return;
